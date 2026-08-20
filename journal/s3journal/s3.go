@@ -99,8 +99,8 @@ func (j *S3Journal) entryKey(invocationID string, step int) string {
 	return fmt.Sprintf("%s%020d.json", j.entriesPrefix(invocationID), step)
 }
 
-// entryRecord is the stored form of an entry. It keeps the epoch of the
-// writer, so an operator can tell which holder recorded the step.
+// entryRecord is the stored form of an entry. The epoch is kept for
+// attribution only, so an operator can tell which holder wrote the step.
 type entryRecord struct {
 	journal.Entry
 	Epoch lease.Epoch `json:"epoch"`
@@ -220,22 +220,14 @@ func (j *S3Journal) Release(ctx context.Context, l *lease.Lease) error {
 	return nil
 }
 
-// Append writes one entry under epoch. It returns lease.ErrLeaseLost if
-// epoch is not the epoch of the live lease on the invocation.
+// Append writes one entry. The conditional write on the entry key is
+// the fence, so Append needs no lease and never reads one.
 func (j *S3Journal) Append(ctx context.Context, invocationID string, epoch lease.Epoch, e journal.Entry) error {
 	if invocationID == "" {
 		return errors.New("s3journal: empty invocation id")
 	}
 	if e.Step < 0 {
 		return fmt.Errorf("s3journal: negative step %d", e.Step)
-	}
-
-	current, _, err := j.getLease(ctx, j.leaseKey(invocationID))
-	if err != nil {
-		return err
-	}
-	if !live(current) || current.Epoch != epoch {
-		return lease.ErrLeaseLost
 	}
 
 	body, err := json.Marshal(entryRecord{Entry: e, Epoch: epoch})
@@ -248,8 +240,8 @@ func (j *S3Journal) Append(ctx context.Context, invocationID string, epoch lease
 		Key:         aws.String(j.entryKey(invocationID, e.Step)),
 		Body:        bytes.NewReader(body),
 		ContentType: aws.String("application/json"),
-		// The step is written once. This condition is the fence that
-		// stops a stale holder from forking the history.
+		// The fence. This condition is atomic, so one writer wins the
+		// step whatever the lease says, and the entry never changes.
 		IfNoneMatch: aws.String("*"),
 	})
 	if err != nil {

@@ -158,9 +158,6 @@ func TestClaimBySameOwnerBumpsEpoch(t *testing.T) {
 	if second.Epoch != first.Epoch+1 {
 		t.Fatalf("epoch = %d, want %d", second.Epoch, first.Epoch+1)
 	}
-	if err := j.Append(ctx, first.Resource, first.Epoch, journal.Entry{Name: "stale"}); !errors.Is(err, lease.ErrLeaseLost) {
-		t.Fatalf("append with old held err = %v, want ErrLeaseLost", err)
-	}
 }
 
 func TestClaimAfterExpiry(t *testing.T) {
@@ -206,12 +203,9 @@ func TestReleaseLetsAnotherOwnerClaim(t *testing.T) {
 	if next.Epoch != held.Epoch+1 {
 		t.Fatalf("epoch = %d, want %d", next.Epoch, held.Epoch+1)
 	}
-	if err := j.Append(ctx, held.Resource, held.Epoch, journal.Entry{Name: "stale"}); !errors.Is(err, lease.ErrLeaseLost) {
-		t.Fatalf("append after release err = %v, want ErrLeaseLost", err)
-	}
 }
 
-func TestAppendWithExpiredLease(t *testing.T) {
+func TestAppendDoesNotReadTheLease(t *testing.T) {
 	t.Parallel()
 	j := newJournal(t)
 	ctx := t.Context()
@@ -222,9 +216,18 @@ func TestAppendWithExpiredLease(t *testing.T) {
 	}
 	time.Sleep(100 * time.Millisecond)
 
-	if err := j.Append(ctx, held.Resource, held.Epoch, journal.Entry{Name: "late"}); !errors.Is(err, lease.ErrLeaseLost) {
-		t.Fatalf("append err = %v, want ErrLeaseLost", err)
+	// The lease is expired, and the write still lands. The fence is the
+	// conditional write on the step, not the lease.
+	want := journal.Entry{Step: 0, Name: "late"}
+	if err := j.Append(ctx, held.Resource, held.Epoch, want); err != nil {
+		t.Fatalf("append with an expired lease: %v", err)
 	}
+
+	got, err := journal.Collect(j.Read(ctx, "inv-6"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	assertEntries(t, got, []journal.Entry{want})
 }
 
 func TestReadOrdersEntriesByEpoch(t *testing.T) {
@@ -313,9 +316,14 @@ func TestStaleHolderCannotForkHistory(t *testing.T) {
 		t.Fatalf("append after takeover: %v", err)
 	}
 
-	// The stale holder must not add a second entry for any step.
-	if err := j.Append(ctx, stale.Resource, stale.Epoch, journal.Entry{Step: 1, Name: "zombie"}); !errors.Is(err, lease.ErrLeaseLost) {
-		t.Fatalf("zombie append err = %v, want ErrLeaseLost", err)
+	// The step is taken, so the conditional write rejects the stale
+	// holder and the recorded entry does not change.
+	if err := j.Append(ctx, stale.Resource, stale.Epoch, journal.Entry{Step: 1, Name: "zombie"}); !errors.Is(err, journal.ErrNonDeterministic) {
+		t.Fatalf("zombie append err = %v, want ErrNonDeterministic", err)
+	}
+	// A repeat of the step the new holder wrote is safe to adopt.
+	if err := j.Append(ctx, stale.Resource, stale.Epoch, journal.Entry{Step: 1, Name: "next"}); !errors.Is(err, journal.ErrStepExists) {
+		t.Fatalf("zombie repeat err = %v, want ErrStepExists", err)
 	}
 
 	got, err := journal.Collect(j.Read(ctx, "inv-14"))
@@ -325,6 +333,40 @@ func TestStaleHolderCannotForkHistory(t *testing.T) {
 	assertEntries(t, got, []journal.Entry{
 		{Step: 0, Name: "done"}, {Step: 1, Name: "next"},
 	})
+}
+
+// A stale holder that reaches a step first wins it. Append does not
+// stop this, because the epoch is not checked; the holder must stop
+// itself when it loses the lease.
+func TestStaleHolderWinsAnUnwrittenStep(t *testing.T) {
+	t.Parallel()
+	j := newJournal(t)
+	ctx := t.Context()
+
+	stale, err := j.Claim(ctx, "inv-19", "worker-a", 50*time.Millisecond)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	fresh, err := j.Claim(ctx, "inv-19", "worker-b", time.Minute)
+	if err != nil {
+		t.Fatalf("takeover: %v", err)
+	}
+
+	if err := j.Append(ctx, stale.Resource, stale.Epoch, journal.Entry{Step: 0, Name: "raced"}); err != nil {
+		t.Fatalf("stale append: %v", err)
+	}
+	// The new holder now finds the step taken, and adopts it.
+	if err := j.Append(ctx, fresh.Resource, fresh.Epoch, journal.Entry{Step: 0, Name: "raced"}); !errors.Is(err, journal.ErrStepExists) {
+		t.Fatalf("append err = %v, want ErrStepExists", err)
+	}
+
+	got, err := journal.Collect(j.Read(ctx, "inv-19"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	assertEntries(t, got, []journal.Entry{{Step: 0, Name: "raced"}})
 }
 
 func TestRenewKeepsEpochAndExtendsLease(t *testing.T) {

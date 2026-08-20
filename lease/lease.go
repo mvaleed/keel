@@ -8,15 +8,20 @@
 // atomic compare-and-set on the stored lease. A backend with no such
 // primitive cannot implement Locker correctly.
 //
-// Epoch is a fencing token. Each successful Claim returns an epoch
+// Epoch orders the holders. Each successful Claim returns an epoch
 // strictly greater than every epoch before it, and a released lease
 // keeps its epoch so a later holder never repeats one. A holder gives
-// its epoch to the resource it writes, which lets that resource reject
-// a write from a holder that the lease already moved past.
+// its epoch to the resource it writes, which lets that resource name
+// the writer and reject an obviously stale one.
+//
+// An epoch is not a substitute for an atomic write. A resource that
+// checks the epoch separately from the write leaves a gap in which the
+// lease changes hands, so a resource must protect itself and must treat
+// the epoch as a hint. This package grants exclusion, not safety.
 //
 // A lease can be lost at any moment. The local expiry is a hint; the
-// authority is the stored lease. Renew and every fenced write must
-// report ErrLeaseLost, and the holder must then stop its work.
+// authority is the stored lease. Renew reports ErrLeaseLost, and the
+// holder must then stop its work.
 package lease
 
 import (
@@ -32,9 +37,9 @@ var (
 	// unexpired lease on the resource.
 	ErrClaimHeld = errors.New("lease: resource claimed by another owner")
 
-	// ErrLeaseLost is returned by Renew, and by a fenced write, when the
-	// lease expired or another owner took over. The caller must stop and
-	// must re-Claim before it continues.
+	// ErrLeaseLost is returned by Renew, and by a write that checks the
+	// epoch, when the lease expired or another owner took over. The
+	// caller must stop and must re-Claim before it continues.
 	ErrLeaseLost = errors.New("lease: lease no longer held")
 )
 

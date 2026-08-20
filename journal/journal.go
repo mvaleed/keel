@@ -11,11 +11,19 @@
 // this with a conditional write, so every reader sees the invariant.
 //
 // First writer wins. Once Read returns an entry, that entry must never
-// change, or two replays of one invocation disagree.
+// change, or two replays of one invocation disagree. The caller must
+// adopt the stored entry on ErrStepExists, because that is what makes
+// two racing writers converge on one history.
 //
-// Append is fenced by the epoch of the lease on the invocation. A
-// backend that also stores the lease must reject a stale epoch with
-// lease.ErrLeaseLost, and must record the epoch with the entry.
+// The conditional write is the fence. It is atomic, so it holds under a
+// pause, a clock step, or a lost lease, and it is the only thing that
+// keeps the log single-valued. Nothing else may be relied on for this.
+//
+// The epoch is advisory. A backend records it with the entry to tell an
+// operator which holder wrote the step, and may reject a stale epoch
+// with lease.ErrLeaseLost to fail a zombie early. That check reads the
+// lease separately from the write, so it can never be atomic with it,
+// and a backend that omits it is still correct.
 //
 // Read needs no lease, because reading cannot conflict. A worker that
 // reads in order to replay must still claim the lease first.
@@ -65,10 +73,10 @@ type Entry struct {
 // Store is the durable backing for journals. Each entry is immutable and
 // named by its step. Implementations must be concurrency-safe.
 type Store interface {
-	// Append durably records e at step e.Step under epoch. It returns
-	// lease.ErrLeaseLost if epoch is not the current one,
-	// ErrStepExists if the same step and name is recorded, and
-	// ErrNonDeterministic if the step holds another name.
+	// Append durably records e at step e.Step, and returns ErrStepExists
+	// if the same step and name is recorded, ErrNonDeterministic if the
+	// step holds another name, and lease.ErrLeaseLost if epoch is known
+	// to be stale. The first two are authoritative; the last is a hint.
 	Append(ctx context.Context, invocationID string, epoch lease.Epoch, e Entry) error
 
 	// Read yields the invocation's entries in step order, and nothing
