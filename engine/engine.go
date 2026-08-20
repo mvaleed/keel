@@ -40,6 +40,7 @@ func New(store journal.Store, locker lease.Locker, owner string, services map[st
 // one invocation.
 type invokeRequest struct {
 	InvocationID string          `json:"invocation_id"`
+	Handler      string          `json:"handler"`
 	Input        json.RawMessage `json:"input"`
 	Journal      []journal.Entry `json:"journal"`
 }
@@ -52,15 +53,16 @@ type invokeResponse struct {
 	NewEntries []journal.Entry `json:"new_entries,omitempty"`
 }
 
-// Invoke runs, or resumes, the invocation service/id. It hands the
-// journal to the service and appends the new steps the service ran.
-func (e *Engine) Invoke(ctx context.Context, service, id string, input json.RawMessage) (json.RawMessage, error) {
-	url, ok := e.services[service]
-	if !ok {
-		return nil, fmt.Errorf("unknown service %q", service)
+// Invoke runs, or resumes, inv. It hands the journal to the service that
+// hosts the handler, and appends the new steps the service ran.
+func (e *Engine) Invoke(ctx context.Context, inv invocation.Invocation) (json.RawMessage, error) {
+	if err := inv.Validate(); err != nil {
+		return nil, err
 	}
-
-	inv := invocation.Invocation{ID: invocation.ID(id), Service: service, Input: input}
+	url, ok := e.services[inv.Service]
+	if !ok {
+		return nil, fmt.Errorf("unknown service %q", inv.Service)
+	}
 	return e.attempt(ctx, inv, url)
 }
 
@@ -88,6 +90,7 @@ func (e *Engine) attempt(ctx context.Context, inv invocation.Invocation, url str
 
 	out, err := e.call(ctx, url, invokeRequest{
 		InvocationID: string(inv.ID),
+		Handler:      inv.Handler,
 		Input:        inv.Input,
 		Journal:      history,
 	})

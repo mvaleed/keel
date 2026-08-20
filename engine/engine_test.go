@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/keel/keel/engine"
+	"github.com/keel/keel/invocation"
 	"github.com/keel/keel/journal"
 	"github.com/keel/keel/lease"
 )
@@ -125,6 +126,13 @@ func service(t *testing.T, reply any) (url string, got *map[string]json.RawMessa
 	return srv.URL, &last
 }
 
+func inv(service, handler, id string, input json.RawMessage) invocation.Invocation {
+	return invocation.Invocation{
+		Service: service, Handler: handler,
+		ID: invocation.ID(id), Input: input,
+	}
+}
+
 func newEngine(t *testing.T, url string) (*engine.Engine, *fakeStore, *fakeLocker) {
 	t.Helper()
 	store, locker := &fakeStore{}, &fakeLocker{}
@@ -136,7 +144,7 @@ func TestInvokeRejectsAnUnknownService(t *testing.T) {
 	t.Parallel()
 
 	e, _, locker := newEngine(t, "http://unused")
-	if _, err := e.Invoke(t.Context(), "missing", "id-1", nil); err == nil {
+	if _, err := e.Invoke(t.Context(), inv("missing", "Charge", "id-1", nil)); err == nil {
 		t.Fatal("Invoke returned nil, want an error")
 	}
 	// The engine must not claim a lease it cannot use.
@@ -157,7 +165,7 @@ func TestInvokeAppendsTheNewEntries(t *testing.T) {
 	})
 	e, store, locker := newEngine(t, url)
 
-	out, err := e.Invoke(t.Context(), "demo", "id-1", json.RawMessage(`{"amount":5}`))
+	out, err := e.Invoke(t.Context(), inv("demo", "Charge", "id-1", json.RawMessage(`{"amount":5}`)))
 	if err != nil {
 		t.Fatalf("Invoke: %v", err)
 	}
@@ -182,8 +190,8 @@ func TestInvokeAppendsTheNewEntries(t *testing.T) {
 	}
 	// The lease names the service and the id together, so two services
 	// never share one journal.
-	if locker.resource != "demo-id-1" {
-		t.Fatalf("resource = %q, want demo-id-1", locker.resource)
+	if locker.resource != "demo/Charge/id-1" {
+		t.Fatalf("resource = %q, want demo/Charge/id-1", locker.resource)
 	}
 	if locker.lastOwner != "engine-a" {
 		t.Fatalf("owner = %q, want engine-a", locker.lastOwner)
@@ -192,6 +200,10 @@ func TestInvokeAppendsTheNewEntries(t *testing.T) {
 	// The service gets the bare id, not the lease key.
 	if got := string((*req)["invocation_id"]); got != `"id-1"` {
 		t.Fatalf("invocation_id = %s, want \"id-1\"", got)
+	}
+	// It also needs the handler, because one service hosts many.
+	if got := string((*req)["handler"]); got != `"Charge"` {
+		t.Fatalf("handler = %s, want \"Charge\"", got)
 	}
 	if got := string((*req)["input"]); got != `{"amount":5}` {
 		t.Fatalf("input = %s, want {\"amount\":5}", got)
@@ -207,7 +219,7 @@ func TestInvokeSendsTheRecordedHistory(t *testing.T) {
 		{Step: 0, Name: "charge", Output: json.RawMessage(`{"id":"ch_1"}`)},
 	}
 
-	if _, err := e.Invoke(t.Context(), "demo", "id-1", nil); err != nil {
+	if _, err := e.Invoke(t.Context(), inv("demo", "Charge", "id-1", nil)); err != nil {
 		t.Fatalf("Invoke: %v", err)
 	}
 
@@ -230,7 +242,7 @@ func TestInvokeReturnsTheServiceError(t *testing.T) {
 	})
 	e, store, _ := newEngine(t, url)
 
-	_, err := e.Invoke(t.Context(), "demo", "id-1", nil)
+	_, err := e.Invoke(t.Context(), inv("demo", "Charge", "id-1", nil))
 	if err == nil || !strings.Contains(err.Error(), "card declined") {
 		t.Fatalf("err = %v, want card declined", err)
 	}
@@ -249,12 +261,12 @@ func TestInvokeStopsOnALostLease(t *testing.T) {
 	e, store, locker := newEngine(t, url)
 	store.appendErr = lease.ErrLeaseLost
 
-	_, err := e.Invoke(t.Context(), "demo", "id-1", nil)
+	_, err := e.Invoke(t.Context(), inv("demo", "Charge", "id-1", nil))
 	if !errors.Is(err, lease.ErrLeaseLost) {
 		t.Fatalf("err = %v, want ErrLeaseLost", err)
 	}
 	// The message must name the invocation an operator has to look at.
-	if !strings.Contains(err.Error(), "demo-id-1") {
+	if !strings.Contains(err.Error(), "demo/Charge/id-1") {
 		t.Fatalf("err %q does not name the invocation", err)
 	}
 	// The lease is released even when the invocation ends badly.
@@ -270,7 +282,7 @@ func TestInvokeFailsWhenTheClaimFails(t *testing.T) {
 	e, store, locker := newEngine(t, url)
 	locker.claimErr = lease.ErrClaimHeld
 
-	_, err := e.Invoke(t.Context(), "demo", "id-1", nil)
+	_, err := e.Invoke(t.Context(), inv("demo", "Charge", "id-1", nil))
 	if !errors.Is(err, lease.ErrClaimHeld) {
 		t.Fatalf("err = %v, want ErrClaimHeld", err)
 	}
@@ -288,7 +300,7 @@ func TestInvokeFailsWhenTheReadFails(t *testing.T) {
 	store.readErr = errors.New("bucket unreachable")
 
 	// A partial history would make the service replay the wrong steps.
-	_, err := e.Invoke(t.Context(), "demo", "id-1", nil)
+	_, err := e.Invoke(t.Context(), inv("demo", "Charge", "id-1", nil))
 	if err == nil || !strings.Contains(err.Error(), "bucket unreachable") {
 		t.Fatalf("err = %v, want the read error", err)
 	}
@@ -302,12 +314,29 @@ func TestInvokeFailsWhenTheServiceIsUnreachable(t *testing.T) {
 	srv.Close()
 
 	e, _, locker := newEngine(t, url)
-	if _, err := e.Invoke(t.Context(), "demo", "id-1", nil); err == nil {
+	if _, err := e.Invoke(t.Context(), inv("demo", "Charge", "id-1", nil)); err == nil {
 		t.Fatal("Invoke returned nil, want an error")
 	}
 	// The lease is released, so the next attempt need not wait it out.
 	if _, releases := locker.counts(); releases != 1 {
 		t.Fatalf("releases = %d, want 1", releases)
+	}
+}
+
+func TestInvokeRejectsAnInvalidAddress(t *testing.T) {
+	t.Parallel()
+
+	url, _ := service(t, map[string]any{})
+	e, _, locker := newEngine(t, url)
+
+	// The id reaches a storage key, so the engine must not run an
+	// invocation it could not have stored.
+	_, err := e.Invoke(t.Context(), inv("demo", "Charge", "../escape", nil))
+	if !errors.Is(err, invocation.ErrInvalid) {
+		t.Fatalf("err = %v, want ErrInvalid", err)
+	}
+	if claims, _ := locker.counts(); claims != 0 {
+		t.Fatalf("claims = %d, want 0", claims)
 	}
 }
 
@@ -320,7 +349,7 @@ func TestInvokeFailsOnAnUndecodableReply(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	e, _, _ := newEngine(t, srv.URL)
-	_, err := e.Invoke(t.Context(), "demo", "id-1", nil)
+	_, err := e.Invoke(t.Context(), inv("demo", "Charge", "id-1", nil))
 	if err == nil || !strings.Contains(err.Error(), "decoding response") {
 		t.Fatalf("err = %v, want a decode error", err)
 	}
