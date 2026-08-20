@@ -21,6 +21,9 @@ import (
 // fakeStore records what the engine appends, and serves a fixed history.
 type fakeStore struct {
 	mu        sync.Mutex
+	records   map[string]invocation.Record
+	createErr error
+	getErr    error
 	history   []journal.Entry
 	appended  []journal.Entry
 	epochs    []lease.Epoch
@@ -37,6 +40,32 @@ func (f *fakeStore) Append(_ context.Context, _ string, epoch lease.Epoch, e jou
 	f.appended = append(f.appended, e)
 	f.epochs = append(f.epochs, epoch)
 	return nil
+}
+
+func (f *fakeStore) Create(_ context.Context, r invocation.Record) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.createErr != nil {
+		return f.createErr
+	}
+	if _, ok := f.records[r.Key()]; ok {
+		return invocation.ErrExists
+	}
+	f.records[r.Key()] = r
+	return nil
+}
+
+func (f *fakeStore) Get(_ context.Context, key string) (invocation.Record, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.getErr != nil {
+		return invocation.Record{}, f.getErr
+	}
+	r, ok := f.records[key]
+	if !ok {
+		return invocation.Record{}, invocation.ErrNotFound
+	}
+	return r, nil
 }
 
 func (f *fakeStore) Read(context.Context, string) iter.Seq2[journal.Entry, error] {
@@ -135,8 +164,14 @@ func inv(service, handler, id string, input json.RawMessage) invocation.Invocati
 
 func newEngine(t *testing.T, url string) (*engine.Engine, *fakeStore, *fakeLocker) {
 	t.Helper()
-	store, locker := &fakeStore{}, &fakeLocker{}
-	e := engine.New(store, locker, "engine-a", map[string]string{"demo": url})
+	store, locker := &fakeStore{records: map[string]invocation.Record{}}, &fakeLocker{}
+	e, err := engine.New(engine.Config{
+		Records: store, Journal: store, Locker: locker,
+		Services: map[string]string{"demo": url}, Owner: "engine-a",
+	})
+	if err != nil {
+		t.Fatalf("engine.New: %v", err)
+	}
 	return e, store, locker
 }
 
@@ -352,5 +387,193 @@ func TestInvokeFailsOnAnUndecodableReply(t *testing.T) {
 	_, err := e.Invoke(t.Context(), inv("demo", "Charge", "id-1", nil))
 	if err == nil || !strings.Contains(err.Error(), "decoding response") {
 		t.Fatalf("err = %v, want a decode error", err)
+	}
+}
+
+func TestNewRejectsAnIncompleteConfig(t *testing.T) {
+	t.Parallel()
+
+	store, locker := &fakeStore{}, &fakeLocker{}
+	full := engine.Config{Records: store, Journal: store, Locker: locker, Owner: "engine-a"}
+
+	tests := map[string]func(*engine.Config){
+		"no records": func(c *engine.Config) { c.Records = nil },
+		"no journal": func(c *engine.Config) { c.Journal = nil },
+		"no locker":  func(c *engine.Config) { c.Locker = nil },
+		"no owner":   func(c *engine.Config) { c.Owner = "" },
+	}
+	for name, break_ := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			cfg := full
+			break_(&cfg)
+			// A nil store must fail here, not at an unhelpful place later.
+			if _, err := engine.New(cfg); err == nil {
+				t.Fatal("New accepted an incomplete config")
+			}
+		})
+	}
+	if _, err := engine.New(full); err != nil {
+		t.Fatalf("New rejected a complete config: %v", err)
+	}
+}
+
+func TestRegisterRecordsAPendingInvocation(t *testing.T) {
+	t.Parallel()
+
+	e, store, locker := newEngine(t, "http://unused")
+	reg, err := e.Register(t.Context(), inv("demo", "Charge", "order-1", json.RawMessage(`{"amount":5}`)))
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	if !reg.Created {
+		t.Fatal("Created is false for a new invocation")
+	}
+	if reg.Record.Status != invocation.Pending {
+		t.Fatalf("status = %q, want pending", reg.Record.Status)
+	}
+	if reg.Record.CreatedAt.IsZero() {
+		t.Fatal("CreatedAt is zero")
+	}
+	if _, ok := store.records["demo/Charge/order-1"]; !ok {
+		t.Fatalf("stored %v, want demo/Charge/order-1", store.records)
+	}
+	// Registration records the invocation; it must not start it.
+	if claims, _ := locker.counts(); claims != 0 {
+		t.Fatalf("claims = %d, want 0", claims)
+	}
+}
+
+func TestRegisterIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	e, store, _ := newEngine(t, "http://unused")
+	in := inv("demo", "Charge", "order-1", json.RawMessage(`{"amount":5}`))
+
+	first, err := e.Register(t.Context(), in)
+	if err != nil {
+		t.Fatalf("first Register: %v", err)
+	}
+
+	// A retry must find the invocation, not start a second run of it.
+	second, err := e.Register(t.Context(), in)
+	if err != nil {
+		t.Fatalf("second Register: %v", err)
+	}
+	if second.Created {
+		t.Fatal("Created is true for a repeat")
+	}
+	if !second.Record.CreatedAt.Equal(first.Record.CreatedAt) {
+		t.Fatal("the repeat returned a different record")
+	}
+	if len(store.records) != 1 {
+		t.Fatalf("stored %d records, want 1", len(store.records))
+	}
+}
+
+func TestRegisterIgnoresInputWhitespace(t *testing.T) {
+	t.Parallel()
+
+	e, _, _ := newEngine(t, "http://unused")
+	if _, err := e.Register(t.Context(), inv("demo", "Charge", "order-1", json.RawMessage(`{"amount":5}`))); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	// Formatting alone must not look like a conflict.
+	spaced := inv("demo", "Charge", "order-1", json.RawMessage("{ \"amount\" :\n5 }"))
+	reg, err := e.Register(t.Context(), spaced)
+	if err != nil {
+		t.Fatalf("Register with spacing: %v", err)
+	}
+	if reg.Created {
+		t.Fatal("Created is true for a reformatted repeat")
+	}
+}
+
+func TestRegisterRejectsAReusedID(t *testing.T) {
+	t.Parallel()
+
+	e, _, _ := newEngine(t, "http://unused")
+	if _, err := e.Register(t.Context(), inv("demo", "Charge", "order-1", json.RawMessage(`{"amount":5}`))); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	other := inv("demo", "Charge", "order-1", json.RawMessage(`{"amount":9999}`))
+	if _, err := e.Register(t.Context(), other); !errors.Is(err, engine.ErrInputConflict) {
+		t.Fatalf("err = %v, want ErrInputConflict", err)
+	}
+}
+
+func TestRegisterRejectsBadInvocations(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   invocation.Invocation
+		want error
+	}{
+		{"no id", inv("demo", "Charge", "", nil), invocation.ErrInvalid},
+		{"no handler", inv("demo", "", "order-1", nil), invocation.ErrInvalid},
+		{"traversing id", inv("demo", "Charge", "../../x", nil), invocation.ErrInvalid},
+		{"unknown service", inv("nope", "Charge", "order-1", nil), engine.ErrUnknownService},
+		{"input is not json", inv("demo", "Charge", "order-1", json.RawMessage(`{`)), invocation.ErrInvalid},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			e, store, _ := newEngine(t, "http://unused")
+			if _, err := e.Register(t.Context(), tt.in); !errors.Is(err, tt.want) {
+				t.Fatalf("err = %v, want %v", err, tt.want)
+			}
+			// A rejected registration must record nothing.
+			if len(store.records) != 0 {
+				t.Fatalf("stored %d records, want 0", len(store.records))
+			}
+		})
+	}
+}
+
+func TestRegisterReportsAStoreFailure(t *testing.T) {
+	t.Parallel()
+
+	e, store, _ := newEngine(t, "http://unused")
+	store.createErr = errors.New("bucket unreachable")
+
+	// The caller must never be told a record is durable when it is not.
+	_, err := e.Register(t.Context(), inv("demo", "Charge", "order-1", nil))
+	if err == nil || !strings.Contains(err.Error(), "bucket unreachable") {
+		t.Fatalf("err = %v, want the store error", err)
+	}
+}
+
+func TestLookup(t *testing.T) {
+	t.Parallel()
+
+	e, _, _ := newEngine(t, "http://unused")
+	in := inv("demo", "Charge", "order-1", json.RawMessage(`{"a":1}`))
+	if _, err := e.Register(t.Context(), in); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	got, err := e.Lookup(t.Context(), in)
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	// Nothing runs the invocation yet, so it stays pending.
+	if got.Status != invocation.Pending {
+		t.Fatalf("status = %q, want pending", got.Status)
+	}
+}
+
+func TestLookupRejectsBadAddresses(t *testing.T) {
+	t.Parallel()
+
+	e, _, _ := newEngine(t, "http://unused")
+	if _, err := e.Lookup(t.Context(), inv("demo", "Charge", "a/b", nil)); !errors.Is(err, invocation.ErrInvalid) {
+		t.Fatalf("err = %v, want ErrInvalid", err)
+	}
+	if _, err := e.Lookup(t.Context(), inv("demo", "Charge", "never", nil)); !errors.Is(err, invocation.ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
 	}
 }
