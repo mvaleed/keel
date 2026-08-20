@@ -1,55 +1,34 @@
 // Package journal defines the durable, append-only log that Keel replays
 // to recover a workflow, and the Store interface its backends implement.
 //
-// # Contract for an implementer
+// # Invariants a backend must hold
 //
-// A backend must hold these invariants. The engine depends on all of
-// them, and a backend that breaks one corrupts a workflow silently.
+// The engine depends on all of them, and a backend that breaks one
+// corrupts a workflow silently.
 //
-// One entry per step. A step number identifies an entry inside an
-// invocation. Two Append calls for the same step must not both succeed,
-// even from different processes at the same moment. The second call must
-// return ErrStepExists and must not change the stored entry. Enforce
-// this at write time with a conditional write, not at read time with a
-// filter, so every reader sees the invariant without extra logic.
+// One entry per step. Two Append calls for the same step must not both
+// succeed, even from different processes at the same moment. Enforce
+// this with a conditional write, so every reader sees the invariant.
 //
-// First writer wins. Once Read returns an entry for a step, that entry
-// must never change. A replay gives the recorded output to the caller,
-// so a later value would make two replays of one invocation disagree.
-// This is why a duplicate Append fails instead of overwriting.
+// First writer wins. Once Read returns an entry, that entry must never
+// change, or two replays of one invocation disagree.
 //
-// Append is fenced by an epoch. The epoch comes from the lease on the
-// invocation, and the backend records it with the entry, because it
-// tells an operator which holder wrote the step. A backend that also
-// stores the lease must reject an Append whose epoch is not the current
-// one with lease.ErrLeaseLost.
+// Append is fenced by the epoch of the lease on the invocation. A
+// backend that also stores the lease must reject a stale epoch with
+// lease.ErrLeaseLost, and must record the epoch with the entry.
 //
-// Read needs no lease. Reading has no side effect and cannot conflict,
-// so an observer never has to contend with the running engine. A worker
-// that reads in order to replay must still claim the lease first, or it
-// decides what to run from a history another writer is still changing.
+// Read needs no lease, because reading cannot conflict. A worker that
+// reads in order to replay must still claim the lease first.
 //
-// # A handler must not change while an invocation is live
+// # Limits
 //
-// A step is identified by its position, so adding, removing, or
-// reordering the steps of a handler shifts every step after the change.
-// A replay then reads one step's output as another step's, which no
-// backend can detect. Treat such an edit as unsafe while an invocation
-// of that handler is live. Keeping the previous version of the endpoint
-// alive, and pinning a live invocation to it, would remove this limit.
+// A step is identified by its position, so an edit that adds, removes,
+// or reorders the steps of a live handler shifts every later step.
+// VerifyReplay catches this; no backend can.
 //
-// A replay must therefore compare the name it expects at each position
-// against the name the journal recorded, and stop with
-// ErrNonDeterministic on a mismatch. VerifyReplay does this comparison.
-// The name comes from the SDK that ran the step, so the check proves
-// only that two runs agree, not that either is right.
-//
-// # Duplicate work is expected
-//
-// This interface gives exactly-once entries, not exactly-once effects. A
-// process can crash after it runs a step and before it appends. The step
-// then runs again on the next attempt, so a step must be idempotent.
-// What the interface does guarantee is that the journal never forks.
+// The log gives exactly-once entries, not exactly-once effects. A crash
+// between running a step and appending it runs the step again, so a step
+// must be idempotent. The journal never forks.
 package journal
 
 import (
