@@ -7,63 +7,56 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
+	"time"
 
+	"github.com/keel/keel/engine"
 	"github.com/keel/keel/invocation"
 )
 
-// memStore is an invocation.Store that keeps records in a map. Create is
-// write-once, like every real implementation.
-type memStore struct {
-	mu        sync.Mutex
-	records   map[string]invocation.Record
-	createErr error
-	getErr    error
+// fakeRegistrar stands in for the engine. The server holds no rule, so
+// every case here is about HTTP.
+type fakeRegistrar struct {
+	reg     engine.Registration
+	rec     invocation.Record
+	err     error
+	lastInv invocation.Invocation
 }
 
-func newMemStore() *memStore {
-	return &memStore{records: map[string]invocation.Record{}}
+func (f *fakeRegistrar) Register(_ context.Context, inv invocation.Invocation) (engine.Registration, error) {
+	f.lastInv = inv
+	if f.err != nil {
+		return engine.Registration{}, f.err
+	}
+	return f.reg, nil
 }
 
-func (m *memStore) Create(_ context.Context, r invocation.Record) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.createErr != nil {
-		return m.createErr
+func (f *fakeRegistrar) Lookup(_ context.Context, inv invocation.Invocation) (invocation.Record, error) {
+	f.lastInv = inv
+	if f.err != nil {
+		return invocation.Record{}, f.err
 	}
-	if _, ok := m.records[r.Key()]; ok {
-		return invocation.ErrExists
-	}
-	m.records[r.Key()] = r
-	return nil
+	return f.rec, nil
 }
 
-func (m *memStore) Get(_ context.Context, key string) (invocation.Record, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.getErr != nil {
-		return invocation.Record{}, m.getErr
+func record() invocation.Record {
+	return invocation.Record{
+		Invocation: invocation.Invocation{
+			ID: "order-1", Service: "billing", Handler: "Charge",
+		},
+		Status:    invocation.Pending,
+		CreatedAt: time.Now().UTC(),
 	}
-	r, ok := m.records[key]
-	if !ok {
-		return invocation.Record{}, invocation.ErrNotFound
-	}
-	return r, nil
 }
 
-func newServer(t *testing.T) (http.Handler, *memStore) {
-	t.Helper()
-	store := newMemStore()
-	s := &server{records: store, services: map[string]string{"billing": "http://svc"}}
-	return s.routes(), store
+func newServer(reg *fakeRegistrar) http.Handler {
+	return (&server{engine: reg}).routes()
 }
 
 func post(t *testing.T, h http.Handler, body string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/v1/invocations", strings.NewReader(body))
 	w := httptest.NewRecorder()
-	h.ServeHTTP(w, req)
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/invocations", strings.NewReader(body)))
 	return w
 }
 
@@ -76,11 +69,11 @@ func get(t *testing.T, h http.Handler, path string) *httptest.ResponseRecorder {
 
 const valid = `{"id":"order-1","service":"billing","handler":"Charge","input":{"amount":5}}`
 
-func TestRegisterRecordsTheInvocation(t *testing.T) {
+func TestRegisterAnswers202ForANewInvocation(t *testing.T) {
 	t.Parallel()
 
-	h, store := newServer(t)
-	w := post(t, h, valid)
+	reg := &fakeRegistrar{reg: engine.Registration{Record: record(), Created: true}}
+	w := post(t, newServer(reg), valid)
 
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("code = %d, want 202: %s", w.Code, w.Body)
@@ -90,182 +83,139 @@ func TestRegisterRecordsTheInvocation(t *testing.T) {
 		t.Fatalf("Location = %q", got)
 	}
 
-	var body registerResponse
+	var body invocationResponse
 	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decoding: %v", err)
 	}
 	if body.ID != "order-1" || body.Status != invocation.Pending {
-		t.Fatalf("body = %+v, want order-1 pending", body)
-	}
-	if body.CreatedAt.IsZero() {
-		t.Fatal("created_at is zero")
-	}
-
-	rec, err := store.Get(t.Context(), "billing/Charge/order-1")
-	if err != nil {
-		t.Fatalf("record was not stored: %v", err)
-	}
-	// The record must be durable before the client is told 202.
-	if string(rec.Input) != `{"amount":5}` {
-		t.Fatalf("input = %s", rec.Input)
-	}
-	if rec.Status != invocation.Pending {
-		t.Fatalf("status = %q, want pending", rec.Status)
+		t.Fatalf("body = %+v", body)
 	}
 }
 
-func TestRegisterIsIdempotent(t *testing.T) {
+func TestRegisterPassesTheInvocationThrough(t *testing.T) {
 	t.Parallel()
 
-	h, _ := newServer(t)
-	if w := post(t, h, valid); w.Code != http.StatusAccepted {
-		t.Fatalf("first code = %d, want 202", w.Code)
-	}
+	reg := &fakeRegistrar{reg: engine.Registration{Record: record(), Created: true}}
+	post(t, newServer(reg), valid)
 
-	// A retried registration must find the invocation, not start a
-	// second run of it.
-	w := post(t, h, valid)
+	// The body maps onto the invocation without the server reading it.
+	got := reg.lastInv
+	if got.ID != "order-1" || got.Service != "billing" || got.Handler != "Charge" {
+		t.Fatalf("invocation = %+v", got)
+	}
+	if string(got.Input) != `{"amount":5}` {
+		t.Fatalf("input = %s", got.Input)
+	}
+}
+
+func TestRegisterAnswers200ForARepeat(t *testing.T) {
+	t.Parallel()
+
+	reg := &fakeRegistrar{reg: engine.Registration{Record: record()}}
+	w := post(t, newServer(reg), valid)
+
 	if w.Code != http.StatusOK {
-		t.Fatalf("second code = %d, want 200: %s", w.Code, w.Body)
-	}
-}
-
-func TestRegisterIgnoresInputWhitespace(t *testing.T) {
-	t.Parallel()
-
-	h, _ := newServer(t)
-	post(t, h, valid)
-
-	spaced := `{"id":"order-1","service":"billing","handler":"Charge","input":{ "amount" : 5 }}`
-	if w := post(t, h, spaced); w.Code != http.StatusOK {
 		t.Fatalf("code = %d, want 200: %s", w.Code, w.Body)
 	}
-}
-
-func TestRegisterRejectsAReusedID(t *testing.T) {
-	t.Parallel()
-
-	h, _ := newServer(t)
-	post(t, h, valid)
-
-	other := `{"id":"order-1","service":"billing","handler":"Charge","input":{"amount":9999}}`
-	w := post(t, h, other)
-	if w.Code != http.StatusConflict {
-		t.Fatalf("code = %d, want 409: %s", w.Code, w.Body)
+	// A repeat created nothing, so there is nothing new to point at.
+	if got := w.Header().Get("Location"); got != "" {
+		t.Fatalf("Location = %q, want none", got)
 	}
 }
 
-func TestRegisterRejectsBadRequests(t *testing.T) {
+func TestRegisterMapsTheEngineErrors(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name string
-		body string
+		err  error
 		want int
 	}{
-		{"not json", `{`, http.StatusBadRequest},
-		{"no id", `{"service":"billing","handler":"Charge"}`, http.StatusBadRequest},
-		{"no service", `{"id":"a","handler":"Charge"}`, http.StatusBadRequest},
-		{"no handler", `{"id":"a","service":"billing"}`, http.StatusBadRequest},
-		{"unknown service", `{"id":"a","service":"nope","handler":"Charge"}`, http.StatusNotFound},
-		// The id becomes a storage key, so it must never escape.
-		{"traversing id", `{"id":"../../x","service":"billing","handler":"Charge"}`, http.StatusBadRequest},
-		{"slash in id", `{"id":"a/b","service":"billing","handler":"Charge"}`, http.StatusBadRequest},
-		{"slash in service", `{"id":"a","service":"bill/ing","handler":"Charge"}`, http.StatusBadRequest},
+		{"invalid", invocation.ErrInvalid, http.StatusBadRequest},
+		{"unknown service", engine.ErrUnknownService, http.StatusNotFound},
+		{"reused id", engine.ErrInputConflict, http.StatusConflict},
+		{"store failed", errors.New("bucket unreachable"), http.StatusInternalServerError},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			h, store := newServer(t)
-			if w := post(t, h, tt.body); w.Code != tt.want {
+			w := post(t, newServer(&fakeRegistrar{err: tt.err}), valid)
+			if w.Code != tt.want {
 				t.Fatalf("code = %d, want %d: %s", w.Code, tt.want, w.Body)
 			}
-			// A rejected registration must record nothing.
-			if len(store.records) != 0 {
-				t.Fatalf("stored %d records, want 0", len(store.records))
+			var body map[string]string
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil || body["error"] == "" {
+				t.Fatalf("body = %s, want an error message", w.Body)
 			}
 		})
+	}
+}
+
+func TestRegisterRejectsAnUndecodableBody(t *testing.T) {
+	t.Parallel()
+
+	reg := &fakeRegistrar{reg: engine.Registration{Record: record(), Created: true}}
+	if w := post(t, newServer(reg), `{`); w.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d, want 400", w.Code)
+	}
+	// A body the server cannot read must never reach the engine.
+	if reg.lastInv.Service != "" {
+		t.Fatalf("the engine saw %+v", reg.lastInv)
 	}
 }
 
 func TestRegisterRejectsAnOversizeBody(t *testing.T) {
 	t.Parallel()
 
-	h, store := newServer(t)
+	reg := &fakeRegistrar{reg: engine.Registration{Record: record(), Created: true}}
 	big := `{"id":"a","service":"billing","handler":"Charge","input":{"pad":"` +
-		strings.Repeat("x", maxInputSize) + `"}}`
+		strings.Repeat("x", maxRequestSize) + `"}}`
 
-	if w := post(t, h, big); w.Code != http.StatusRequestEntityTooLarge {
+	if w := post(t, newServer(reg), big); w.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("code = %d, want 413", w.Code)
 	}
-	if len(store.records) != 0 {
-		t.Fatalf("stored %d records, want 0", len(store.records))
-	}
-}
-
-func TestRegisterReportsAStoreFailure(t *testing.T) {
-	t.Parallel()
-
-	h, store := newServer(t)
-	store.createErr = errors.New("bucket unreachable")
-
-	// The client must never be told 202 for something that is not
-	// durable.
-	if w := post(t, h, valid); w.Code != http.StatusInternalServerError {
-		t.Fatalf("code = %d, want 500", w.Code)
+	if reg.lastInv.Service != "" {
+		t.Fatalf("the engine saw %+v", reg.lastInv)
 	}
 }
 
 func TestGetReturnsTheRecord(t *testing.T) {
 	t.Parallel()
 
-	h, _ := newServer(t)
-	post(t, h, valid)
+	reg := &fakeRegistrar{rec: record()}
+	w := get(t, newServer(reg), "/v1/invocations/billing/Charge/order-1")
 
-	w := get(t, h, "/v1/invocations/billing/Charge/order-1")
 	if w.Code != http.StatusOK {
 		t.Fatalf("code = %d, want 200: %s", w.Code, w.Body)
 	}
-
-	var body registerResponse
-	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
-		t.Fatalf("decoding: %v", err)
-	}
-	// Nothing runs the invocation yet, so it stays pending.
-	if body.Status != invocation.Pending {
-		t.Fatalf("status = %q, want pending", body.Status)
+	// The path maps onto the address the engine looks up.
+	if reg.lastInv.Key() != "billing/Charge/order-1" {
+		t.Fatalf("looked up %q", reg.lastInv.Key())
 	}
 }
 
-func TestGetUnknownInvocation(t *testing.T) {
+func TestGetMapsTheEngineErrors(t *testing.T) {
 	t.Parallel()
 
-	h, _ := newServer(t)
-	if w := get(t, h, "/v1/invocations/billing/Charge/never"); w.Code != http.StatusNotFound {
+	reg := &fakeRegistrar{err: invocation.ErrNotFound}
+	if w := get(t, newServer(reg), "/v1/invocations/billing/Charge/never"); w.Code != http.StatusNotFound {
 		t.Fatalf("code = %d, want 404", w.Code)
 	}
-}
 
-func TestGetRejectsAnEncodedSeparator(t *testing.T) {
-	t.Parallel()
-
-	h, _ := newServer(t)
-	// The mux decodes %2F after it matches, so the id reaches the
-	// handler holding a separator. Validate is what stops it.
-	if w := get(t, h, "/v1/invocations/billing/Charge/a%2Fb"); w.Code != http.StatusBadRequest {
-		t.Fatalf("code = %d, want 400: %s", w.Code, w.Body)
+	bad := &fakeRegistrar{err: invocation.ErrInvalid}
+	if w := get(t, newServer(bad), "/v1/invocations/billing/Charge/a%2Fb"); w.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d, want 400", w.Code)
 	}
 }
 
 func TestGetDoesNotServeATraversal(t *testing.T) {
 	t.Parallel()
 
-	h, _ := newServer(t)
+	reg := &fakeRegistrar{rec: record()}
 	// The mux cleans the path before it matches, so a traversal never
 	// reaches a handler at all.
-	w := get(t, h, "/v1/invocations/billing/Charge/..")
-	if w.Code == http.StatusOK {
-		t.Fatalf("code = %d, want anything but 200: %s", w.Code, w.Body)
+	if w := get(t, newServer(reg), "/v1/invocations/billing/Charge/.."); w.Code == http.StatusOK {
+		t.Fatalf("code = %d, want anything but 200", w.Code)
 	}
 }
 

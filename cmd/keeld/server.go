@@ -1,25 +1,32 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"time"
 
+	"github.com/keel/keel/engine"
 	"github.com/keel/keel/invocation"
 )
 
-// maxInputSize bounds the input of one invocation. The whole input goes
-// to the service in one request body, so it must stay small.
-const maxInputSize = 1 << 20
+// maxRequestSize bounds one registration. The whole input goes to the
+// service in one request body, so it must stay small.
+const maxRequestSize = 1 << 20
 
-// server registers invocations. It does not run them; a dispatcher reads
-// the pending index and does that.
+// A registrar records invocations. The server declares what it needs, so
+// a test needs no engine.
+type registrar interface {
+	Register(context.Context, invocation.Invocation) (engine.Registration, error)
+	Lookup(context.Context, invocation.Invocation) (invocation.Record, error)
+}
+
+// server maps HTTP onto the engine. It holds no rule of its own, so the
+// SDK protocol can reach the same rules another way.
 type server struct {
-	records  invocation.Store
-	services map[string]string // service name -> invoke URL
+	engine registrar
 }
 
 func (s *server) routes() http.Handler {
@@ -38,8 +45,8 @@ type registerRequest struct {
 	Input   json.RawMessage `json:"input,omitempty"`
 }
 
-// registerResponse tells the client the address it can poll.
-type registerResponse struct {
+// invocationResponse tells the client the address it can poll.
+type invocationResponse struct {
 	ID        string            `json:"id"`
 	Service   string            `json:"service"`
 	Handler   string            `json:"handler"`
@@ -47,15 +54,14 @@ type registerResponse struct {
 	CreatedAt time.Time         `json:"created_at"`
 }
 
-// register records the invocation and returns before anything runs. It
-// answers 202 for a new invocation and 200 for a repeat of one.
+// register records the invocation and answers before anything runs it.
 func (s *server) register(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxInputSize+1))
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestSize+1))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "reading the request body")
 		return
 	}
-	if len(body) > maxInputSize {
+	if len(body) > maxRequestSize {
 		writeError(w, http.StatusRequestEntityTooLarge, "the request is larger than 1 MiB")
 		return
 	}
@@ -66,91 +72,59 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Compact the input before it is hashed, so that whitespace alone
-	// does not make one registration look like a conflict with itself.
-	input, err := compact(req.Input)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "the input is not valid JSON")
-		return
-	}
-
-	inv := invocation.Invocation{
+	reg, err := s.engine.Register(r.Context(), invocation.Invocation{
 		ID:      invocation.ID(req.ID),
 		Service: req.Service,
 		Handler: req.Handler,
-		Input:   input,
-	}
-	if err := inv.Validate(); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	// An invocation for a service the engine cannot reach is a promise
-	// that nothing can keep, so it must not be recorded.
-	if _, ok := s.services[inv.Service]; !ok {
-		writeError(w, http.StatusNotFound, "unknown service "+inv.Service)
-		return
-	}
-
-	rec := invocation.Record{
-		Invocation: inv,
-		Status:     invocation.Pending,
-		InputHash:  invocation.HashInput(input),
-		CreatedAt:  time.Now().UTC(),
-	}
-
-	switch err := s.records.Create(r.Context(), rec); {
-	case err == nil:
-		w.Header().Set("Location", "/v1/invocations/"+inv.Key())
-		writeJSON(w, http.StatusAccepted, response(rec))
-	case errors.Is(err, invocation.ErrExists):
-		s.repeat(w, r, rec)
-	default:
-		writeError(w, http.StatusInternalServerError, err.Error())
-	}
-}
-
-// repeat answers a registration whose address is already taken. The same
-// input is a retry, and a different input is a reused id.
-func (s *server) repeat(w http.ResponseWriter, r *http.Request, want invocation.Record) {
-	got, err := s.records.Get(r.Context(), want.Key())
+		Input:   req.Input,
+	})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, statusFor(err), err.Error())
 		return
 	}
-	if got.InputHash != want.InputHash {
-		writeError(w, http.StatusConflict,
-			"invocation "+want.Key()+" is registered with a different input")
-		return
+
+	// A repeat of a registration is not a new invocation, and the code
+	// is what tells the client which one it got.
+	code := http.StatusOK
+	if reg.Created {
+		code = http.StatusAccepted
+		w.Header().Set("Location", "/v1/invocations/"+reg.Record.Key())
 	}
-	writeJSON(w, http.StatusOK, response(got))
+	writeJSON(w, code, response(reg.Record))
 }
 
 // get returns the recorded invocation, which a client polls because
 // registration does not wait for the run.
 func (s *server) get(w http.ResponseWriter, r *http.Request) {
-	inv := invocation.Invocation{
+	rec, err := s.engine.Lookup(r.Context(), invocation.Invocation{
 		ID:      invocation.ID(r.PathValue("id")),
 		Service: r.PathValue("service"),
 		Handler: r.PathValue("handler"),
-	}
-	if err := inv.Validate(); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	})
+	if err != nil {
+		writeError(w, statusFor(err), err.Error())
 		return
 	}
+	writeJSON(w, http.StatusOK, response(rec))
+}
 
-	rec, err := s.records.Get(r.Context(), inv.Key())
+// statusFor maps a domain error onto a status code. It is the only
+// place that knows both, so a new transport maps the same errors again.
+func statusFor(err error) int {
 	switch {
-	case errors.Is(err, invocation.ErrNotFound):
-		writeError(w, http.StatusNotFound, "no invocation "+inv.Key())
-	case err != nil:
-		writeError(w, http.StatusInternalServerError, err.Error())
+	case errors.Is(err, invocation.ErrInvalid):
+		return http.StatusBadRequest
+	case errors.Is(err, engine.ErrUnknownService), errors.Is(err, invocation.ErrNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, engine.ErrInputConflict):
+		return http.StatusConflict
 	default:
-		writeJSON(w, http.StatusOK, response(rec))
+		return http.StatusInternalServerError
 	}
 }
 
-func response(r invocation.Record) registerResponse {
-	return registerResponse{
+func response(r invocation.Record) invocationResponse {
+	return invocationResponse{
 		ID:        string(r.ID),
 		Service:   r.Service,
 		Handler:   r.Handler,
@@ -159,25 +133,10 @@ func response(r invocation.Record) registerResponse {
 	}
 }
 
-// compact removes the whitespace from raw. It returns nil for no input,
-// so an absent and an empty input hash the same.
-func compact(raw json.RawMessage) (json.RawMessage, error) {
-	if len(bytes.TrimSpace(raw)) == 0 {
-		return nil, nil
-	}
-	var out bytes.Buffer
-	if err := json.Compact(&out, raw); err != nil {
-		return nil, err
-	}
-	return out.Bytes(), nil
-}
-
 func writeJSON(w http.ResponseWriter, code int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	if err := json.NewEncoder(w).Encode(body); err != nil {
-		return
-	}
+	_ = json.NewEncoder(w).Encode(body)
 }
 
 func writeError(w http.ResponseWriter, code int, msg string) {

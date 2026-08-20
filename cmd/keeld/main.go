@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/keel/keel/engine"
 	"github.com/keel/keel/s3store"
 )
 
@@ -39,7 +40,20 @@ func main() {
 		log.Fatalf("opening store: %v", err)
 	}
 
-	srv := &server{records: store, services: svcMap}
+	// One backend satisfies all three stores. This is the only place
+	// that knows which backend it is.
+	e, err := engine.New(engine.Config{
+		Records:  store,
+		Journal:  store,
+		Locker:   store,
+		Services: svcMap,
+		Owner:    *owner,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	srv := &server{engine: e}
 	log.Printf("keeld listening on %s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, srv.routes()))
 }
