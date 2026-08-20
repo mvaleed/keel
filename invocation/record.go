@@ -1,10 +1,13 @@
 package invocation
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"iter"
 	"time"
 )
@@ -75,4 +78,18 @@ type PendingIndex interface {
 func HashInput(input []byte) string {
 	sum := sha256.Sum256(input)
 	return hex.EncodeToString(sum[:])
+}
+
+// Compact removes the whitespace from raw, so that two registrations
+// that differ only in formatting hash the same. It returns nil for no
+// input, which makes an absent and an empty input one case.
+func Compact(raw json.RawMessage) (json.RawMessage, error) {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, nil
+	}
+	var out bytes.Buffer
+	if err := json.Compact(&out, raw); err != nil {
+		return nil, fmt.Errorf("%w: input is not JSON", ErrInvalid)
+	}
+	return out.Bytes(), nil
 }

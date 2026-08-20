@@ -1,6 +1,7 @@
 package invocation_test
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -129,5 +130,54 @@ func TestNewIDIsValid(t *testing.T) {
 	}
 	if err := inv("s", "h", string(id)).Validate(); err != nil {
 		t.Fatalf("NewID gave %q, which Validate rejects: %v", id, err)
+	}
+}
+
+func TestCompact(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"already compact", `{"a":1}`, `{"a":1}`},
+		{"spaced", "{ \"a\" :\n 1 }", `{"a":1}`},
+		{"nested", `{ "a": [ 1, 2 ] }`, `{"a":[1,2]}`},
+		{"scalar", ` 5 `, `5`},
+		{"empty", ``, ``},
+		{"whitespace only", "  \n", ``},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := invocation.Compact(json.RawMessage(tt.in))
+			if err != nil {
+				t.Fatalf("Compact: %v", err)
+			}
+			if string(got) != tt.want {
+				t.Fatalf("Compact(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCompactRejectsBadJSON(t *testing.T) {
+	t.Parallel()
+
+	if _, err := invocation.Compact(json.RawMessage(`{`)); !errors.Is(err, invocation.ErrInvalid) {
+		t.Fatalf("err = %v, want ErrInvalid", err)
+	}
+}
+
+// Formatting alone must not make one registration look like a conflict
+// with itself.
+func TestCompactMakesEqualInputsHashEqual(t *testing.T) {
+	t.Parallel()
+
+	a, _ := invocation.Compact(json.RawMessage(`{"a":1,"b":[2]}`))
+	b, _ := invocation.Compact(json.RawMessage("{ \"a\" : 1 ,\n\"b\" : [ 2 ] }"))
+	if invocation.HashInput(a) != invocation.HashInput(b) {
+		t.Fatalf("%q and %q hash differently", a, b)
 	}
 }
