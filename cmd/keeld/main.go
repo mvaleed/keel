@@ -12,7 +12,7 @@ import (
 	"strings"
 
 	"github.com/keel/keel/engine"
-	"github.com/keel/keel/journal/s3journal"
+	"github.com/keel/keel/s3store"
 )
 
 func main() {
@@ -45,7 +45,7 @@ func main() {
 	if *bucket == "" {
 		log.Fatal("-bucket is required")
 	}
-	store, err := s3journal.NewS3Journal(*bucket, *prefix)
+	store, err := s3store.NewFromEnv(*bucket, *prefix)
 	if err != nil {
 		log.Fatalf("opening journal store: %v", err)
 	}

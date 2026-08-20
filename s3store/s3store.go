@@ -1,6 +1,11 @@
-// Package s3journal stores a journal in an S3 bucket, and the leases
-// that fence it. It uses the conditional writes of S3 for both.
-package s3journal
+// Package s3store keeps everything one invocation needs in one S3
+// bucket: its record, its lease, and its journal. It uses the
+// conditional writes of S3 for all three.
+//
+// One bucket means one failure domain and one prefix to delete. The
+// interfaces stay separate, so another backend can implement any one of
+// them alone.
+package s3store
 
 import (
 	"bytes"
@@ -21,13 +26,14 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 
+	"github.com/keel/keel/invocation"
 	"github.com/keel/keel/journal"
 	"github.com/keel/keel/lease"
 )
 
-// maxEntrySize limits one entry object. A larger object is a defect in
-// the caller, and a read of it must not exhaust memory.
-const maxEntrySize = 8 << 20
+// maxObjectSize limits one stored object. A larger object is a defect
+// in the caller, and a read of it must not exhaust memory.
+const maxObjectSize = 8 << 20
 
 // api is the part of the S3 client that the journal uses. A test
 // supplies its own implementation.
@@ -35,19 +41,22 @@ type api interface {
 	GetObject(context.Context, *s3.GetObjectInput, ...func(*s3.Options)) (*s3.GetObjectOutput, error)
 	PutObject(context.Context, *s3.PutObjectInput, ...func(*s3.Options)) (*s3.PutObjectOutput, error)
 	ListObjectsV2(context.Context, *s3.ListObjectsV2Input, ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
+	DeleteObject(context.Context, *s3.DeleteObjectInput, ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
 }
 
-// S3Journal keeps every lease and entry as an object in one bucket. It
-// is safe for concurrent use.
-type S3Journal struct {
+// Store keeps every record, lease, and entry as an object in one
+// bucket. It is safe for concurrent use.
+type Store struct {
 	client     api
 	bucket     string
 	rootPrefix string
 }
 
 var (
-	_ journal.Store = (*S3Journal)(nil)
-	_ lease.Locker  = (*S3Journal)(nil)
+	_ journal.Store           = (*Store)(nil)
+	_ lease.Locker            = (*Store)(nil)
+	_ invocation.Store        = (*Store)(nil)
+	_ invocation.PendingIndex = (*Store)(nil)
 )
 
 // leaseRecord is the stored form of a lease. A released lease keeps its
@@ -59,43 +68,63 @@ type leaseRecord struct {
 	Released bool        `json:"released,omitempty"`
 }
 
-// New returns a journal that uses the given client. Use it to supply a
+// New returns a store that uses the given client. Use it to supply a
 // client with a custom endpoint or custom credentials.
-func New(client api, bucket, rootPrefix string) (*S3Journal, error) {
+func New(client api, bucket, rootPrefix string) (*Store, error) {
 	if client == nil {
-		return nil, errors.New("s3journal: nil client")
+		return nil, errors.New("s3store: nil client")
 	}
 	if bucket == "" {
-		return nil, errors.New("s3journal: empty bucket")
+		return nil, errors.New("s3store: empty bucket")
 	}
-	return &S3Journal{
+	return &Store{
 		client:     client,
 		bucket:     bucket,
 		rootPrefix: strings.Trim(rootPrefix, "/"),
 	}, nil
 }
 
-// NewS3Journal returns a journal that uses the default AWS configuration
-// of the environment.
-func NewS3Journal(bucket string, rootPrefix string) (*S3Journal, error) {
+// NewFromEnv returns a store that uses the default AWS configuration of
+// the environment.
+func NewFromEnv(bucket string, rootPrefix string) (*Store, error) {
 	cfg, err := config.LoadDefaultConfig(context.Background())
 	if err != nil {
-		return nil, fmt.Errorf("s3journal: load AWS config: %w", err)
+		return nil, fmt.Errorf("s3store: load AWS config: %w", err)
 	}
 	return New(s3.NewFromConfig(cfg), bucket, rootPrefix)
 }
 
-func (j *S3Journal) leaseKey(invocationID string) string {
-	return path.Join(j.rootPrefix, "invocations", invocationID, "lease.json")
+// invocationPrefix is the subtree of one invocation. The key holds the
+// service, the handler, and the id, which invocation.Validate checks.
+func (j *Store) invocationPrefix(key string) string {
+	return path.Join(j.rootPrefix, "invocations", key)
 }
 
-func (j *S3Journal) entriesPrefix(invocationID string) string {
-	return path.Join(j.rootPrefix, "invocations", invocationID, "entries") + "/"
+func (j *Store) recordKey(key string) string {
+	return path.Join(j.invocationPrefix(key), "invocation.json")
+}
+
+func (j *Store) leaseKey(key string) string {
+	return path.Join(j.invocationPrefix(key), "lease.json")
+}
+
+func (j *Store) entriesPrefix(key string) string {
+	return path.Join(j.invocationPrefix(key), "entries") + "/"
+}
+
+// pendingPrefix is the index a dispatcher scans. A marker is an empty
+// object, so a scan reads only the listing.
+func (j *Store) pendingPrefix() string {
+	return path.Join(j.rootPrefix, "pending") + "/"
+}
+
+func (j *Store) pendingKey(key string) string {
+	return j.pendingPrefix() + key
 }
 
 // entryKey names an entry by its step. The step is zero-padded, so a
 // listing returns the entries in the order that Read must give them.
-func (j *S3Journal) entryKey(invocationID string, step int) string {
+func (j *Store) entryKey(invocationID string, step int) string {
 	return fmt.Sprintf("%s%020d.json", j.entriesPrefix(invocationID), step)
 }
 
@@ -106,14 +135,121 @@ type entryRecord struct {
 	Epoch lease.Epoch `json:"epoch"`
 }
 
+// Create writes the record once and adds the invocation to the pending
+// index. It returns invocation.ErrExists if the address is taken.
+func (j *Store) Create(ctx context.Context, r invocation.Record) error {
+	if err := r.Validate(); err != nil {
+		return err
+	}
+
+	body, err := json.Marshal(r)
+	if err != nil {
+		return fmt.Errorf("s3store: marshal record: %w", err)
+	}
+
+	key := r.Key()
+	_, err = j.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(j.bucket),
+		Key:         aws.String(j.recordKey(key)),
+		Body:        bytes.NewReader(body),
+		ContentType: aws.String("application/json"),
+		// The address is written once. A retried registration finds the
+		// record instead of starting a second run.
+		IfNoneMatch: aws.String("*"),
+	})
+	if err != nil {
+		if isPreconditionFailed(err) {
+			return invocation.ErrExists
+		}
+		return fmt.Errorf("s3store: put record: %w", err)
+	}
+
+	// The marker goes in after the record, so a scan never yields a key
+	// that Get cannot read. A crash between the two leaves an
+	// undispatched record, which is why Create is safe to repeat.
+	if _, err := j.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(j.bucket),
+		Key:    aws.String(j.pendingKey(key)),
+		Body:   bytes.NewReader(nil),
+	}); err != nil {
+		return fmt.Errorf("s3store: put pending marker: %w", err)
+	}
+	return nil
+}
+
+// Get returns the record at key, and invocation.ErrNotFound if there is
+// none.
+func (j *Store) Get(ctx context.Context, key string) (invocation.Record, error) {
+	if key == "" {
+		return invocation.Record{}, fmt.Errorf("%w: empty key", invocation.ErrInvalid)
+	}
+
+	body, _, err := j.getObject(ctx, j.recordKey(key))
+	if err != nil {
+		if isNotFound(err) {
+			return invocation.Record{}, invocation.ErrNotFound
+		}
+		return invocation.Record{}, fmt.Errorf("s3store: get record: %w", err)
+	}
+
+	var r invocation.Record
+	if err := json.Unmarshal(body, &r); err != nil {
+		return invocation.Record{}, fmt.Errorf("s3store: unmarshal record %q: %w", key, err)
+	}
+	return r, nil
+}
+
+// Pending yields the key of every invocation that is not dispatched.
+func (j *Store) Pending(ctx context.Context) iter.Seq2[string, error] {
+	return func(yield func(string, error) bool) {
+		prefix := j.pendingPrefix()
+		pages := s3.NewListObjectsV2Paginator(j.client, &s3.ListObjectsV2Input{
+			Bucket: aws.String(j.bucket),
+			Prefix: aws.String(prefix),
+		})
+
+		for pages.HasMorePages() {
+			page, err := pages.NextPage(ctx)
+			if err != nil {
+				yield("", fmt.Errorf("s3store: list pending: %w", err))
+				return
+			}
+			for _, obj := range page.Contents {
+				key := strings.TrimPrefix(aws.ToString(obj.Key), prefix)
+				if key == "" {
+					continue
+				}
+				if !yield(key, nil) {
+					return
+				}
+			}
+		}
+	}
+}
+
+// ClearPending drops key from the index. Clearing a key that is not in
+// the index is not an error.
+func (j *Store) ClearPending(ctx context.Context, key string) error {
+	if key == "" {
+		return fmt.Errorf("%w: empty key", invocation.ErrInvalid)
+	}
+	if _, err := j.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(j.bucket),
+		Key:    aws.String(j.pendingKey(key)),
+	}); err != nil {
+		return fmt.Errorf("s3store: delete pending marker: %w", err)
+	}
+	return nil
+}
+
 // Claim takes the lease for ttl. It returns lease.ErrClaimHeld if
 // another owner holds a lease that is not expired.
-func (j *S3Journal) Claim(ctx context.Context, resource, owner string, ttl time.Duration) (*lease.Lease, error) {
+func (j *Store) Claim(ctx context.Context, resource, owner string, ttl time.Duration) (*lease.Lease, error) {
 	if resource == "" || owner == "" {
-		return nil, errors.New("s3journal: empty resource or owner")
+		return nil, errors.New("s3store: empty resource or owner")
 	}
 	if ttl <= 0 {
-		return nil, errors.New("s3journal: ttl must be positive")
+		return nil, errors.New("s3store: ttl must be positive")
 	}
 
 	key := j.leaseKey(resource)
@@ -143,12 +279,12 @@ func (j *S3Journal) Claim(ctx context.Context, resource, owner string, ttl time.
 
 // Renew extends the lease under the same epoch. It returns
 // lease.ErrLeaseLost if the stored lease is no longer this holder's.
-func (j *S3Journal) Renew(ctx context.Context, l *lease.Lease, ttl time.Duration) error {
+func (j *Store) Renew(ctx context.Context, l *lease.Lease, ttl time.Duration) error {
 	if l == nil {
-		return errors.New("s3journal: nil lease")
+		return errors.New("s3store: nil lease")
 	}
 	if ttl <= 0 {
-		return errors.New("s3journal: ttl must be positive")
+		return errors.New("s3store: ttl must be positive")
 	}
 
 	key := j.leaseKey(l.Resource)
@@ -190,9 +326,9 @@ func holds(current *leaseRecord, l *lease.Lease) bool {
 
 // Release drops the lease. It is not an error to release a lease that
 // the holder already lost.
-func (j *S3Journal) Release(ctx context.Context, l *lease.Lease) error {
+func (j *Store) Release(ctx context.Context, l *lease.Lease) error {
 	if l == nil {
-		return errors.New("s3journal: nil lease")
+		return errors.New("s3store: nil lease")
 	}
 
 	key := j.leaseKey(l.Resource)
@@ -222,17 +358,17 @@ func (j *S3Journal) Release(ctx context.Context, l *lease.Lease) error {
 
 // Append writes one entry. The conditional write on the entry key is
 // the fence, so Append needs no lease and never reads one.
-func (j *S3Journal) Append(ctx context.Context, invocationID string, epoch lease.Epoch, e journal.Entry) error {
+func (j *Store) Append(ctx context.Context, invocationID string, epoch lease.Epoch, e journal.Entry) error {
 	if invocationID == "" {
-		return errors.New("s3journal: empty invocation id")
+		return errors.New("s3store: empty invocation id")
 	}
 	if e.Step < 0 {
-		return fmt.Errorf("s3journal: negative step %d", e.Step)
+		return fmt.Errorf("s3store: negative step %d", e.Step)
 	}
 
 	body, err := json.Marshal(entryRecord{Entry: e, Epoch: epoch})
 	if err != nil {
-		return fmt.Errorf("s3journal: marshal entry: %w", err)
+		return fmt.Errorf("s3store: marshal entry: %w", err)
 	}
 
 	_, err = j.client.PutObject(ctx, &s3.PutObjectInput{
@@ -248,14 +384,14 @@ func (j *S3Journal) Append(ctx context.Context, invocationID string, epoch lease
 		if isPreconditionFailed(err) {
 			return j.classifyConflict(ctx, invocationID, e)
 		}
-		return fmt.Errorf("s3journal: put entry: %w", err)
+		return fmt.Errorf("s3store: put entry: %w", err)
 	}
 	return nil
 }
 
 // classifyConflict tells a repeat of a step from a different step that
 // took its place. Only the first is safe for the caller to adopt.
-func (j *S3Journal) classifyConflict(ctx context.Context, invocationID string, e journal.Entry) error {
+func (j *Store) classifyConflict(ctx context.Context, invocationID string, e journal.Entry) error {
 	stored, err := j.getEntry(ctx, j.entryKey(invocationID, e.Step))
 	if err != nil {
 		return err
@@ -269,10 +405,10 @@ func (j *S3Journal) classifyConflict(ctx context.Context, invocationID string, e
 
 // Read yields the entries of the invocation in step order. It needs no
 // lease, and yields nothing for an unknown invocation.
-func (j *S3Journal) Read(ctx context.Context, invocationID string) iter.Seq2[journal.Entry, error] {
+func (j *Store) Read(ctx context.Context, invocationID string) iter.Seq2[journal.Entry, error] {
 	return func(yield func(journal.Entry, error) bool) {
 		if invocationID == "" {
-			yield(journal.Entry{}, errors.New("s3journal: empty invocation id"))
+			yield(journal.Entry{}, errors.New("s3store: empty invocation id"))
 			return
 		}
 
@@ -284,7 +420,7 @@ func (j *S3Journal) Read(ctx context.Context, invocationID string) iter.Seq2[jou
 		for pages.HasMorePages() {
 			page, err := pages.NextPage(ctx)
 			if err != nil {
-				yield(journal.Entry{}, fmt.Errorf("s3journal: list entries: %w", err))
+				yield(journal.Entry{}, fmt.Errorf("s3store: list entries: %w", err))
 				return
 			}
 			for _, obj := range page.Contents {
@@ -297,64 +433,65 @@ func (j *S3Journal) Read(ctx context.Context, invocationID string) iter.Seq2[jou
 	}
 }
 
-func (j *S3Journal) getEntry(ctx context.Context, key string) (journal.Entry, error) {
+// getObject reads one object whole. It returns the raw error, so a
+// caller can tell a missing object from a failure.
+func (j *Store) getObject(ctx context.Context, key string) ([]byte, string, error) {
 	out, err := j.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(j.bucket),
 		Key:    aws.String(key),
 	})
 	if err != nil {
-		return journal.Entry{}, fmt.Errorf("s3journal: get entry %q: %w", key, err)
+		return nil, "", err
 	}
 	defer func() { _ = out.Body.Close() }()
 
-	body, err := io.ReadAll(io.LimitReader(out.Body, maxEntrySize+1))
+	body, err := io.ReadAll(io.LimitReader(out.Body, maxObjectSize+1))
 	if err != nil {
-		return journal.Entry{}, fmt.Errorf("s3journal: read entry %q: %w", key, err)
+		return nil, "", fmt.Errorf("s3store: read %q: %w", key, err)
 	}
-	if len(body) > maxEntrySize {
-		return journal.Entry{}, fmt.Errorf("s3journal: entry %q is larger than %d bytes", key, maxEntrySize)
+	if len(body) > maxObjectSize {
+		return nil, "", fmt.Errorf("s3store: object %q is larger than %d bytes", key, maxObjectSize)
+	}
+	return body, aws.ToString(out.ETag), nil
+}
+
+func (j *Store) getEntry(ctx context.Context, key string) (journal.Entry, error) {
+	body, _, err := j.getObject(ctx, key)
+	if err != nil {
+		return journal.Entry{}, fmt.Errorf("s3store: get entry %q: %w", key, err)
 	}
 
 	var rec entryRecord
 	if err := json.Unmarshal(body, &rec); err != nil {
-		return journal.Entry{}, fmt.Errorf("s3journal: unmarshal entry %q: %w", key, err)
+		return journal.Entry{}, fmt.Errorf("s3store: unmarshal entry %q: %w", key, err)
 	}
 	return rec.Entry, nil
 }
 
 // getLease returns the stored lease and its ETag. It returns a nil
 // record if no lease object exists yet.
-func (j *S3Journal) getLease(ctx context.Context, key string) (*leaseRecord, string, error) {
-	out, err := j.client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(j.bucket),
-		Key:    aws.String(key),
-	})
+func (j *Store) getLease(ctx context.Context, key string) (*leaseRecord, string, error) {
+	body, etag, err := j.getObject(ctx, key)
 	if err != nil {
 		if isNotFound(err) {
 			return nil, "", nil
 		}
-		return nil, "", fmt.Errorf("s3journal: get lease: %w", err)
-	}
-	defer func() { _ = out.Body.Close() }()
-
-	body, err := io.ReadAll(io.LimitReader(out.Body, maxEntrySize))
-	if err != nil {
-		return nil, "", fmt.Errorf("s3journal: read lease: %w", err)
+		return nil, "", fmt.Errorf("s3store: get lease: %w", err)
 	}
 
 	var rec leaseRecord
 	if err := json.Unmarshal(body, &rec); err != nil {
-		return nil, "", fmt.Errorf("s3journal: unmarshal lease: %w", err)
+		return nil, "", fmt.Errorf("s3store: unmarshal lease: %w", err)
 	}
-	return &rec, aws.ToString(out.ETag), nil
+	return &rec, etag, nil
 }
 
 // putLease writes the lease only if the stored object still has etag. An
 // empty etag requires that no object exists.
-func (j *S3Journal) putLease(ctx context.Context, key string, rec leaseRecord, etag string) error {
+func (j *Store) putLease(ctx context.Context, key string, rec leaseRecord, etag string) error {
 	body, err := json.Marshal(rec)
 	if err != nil {
-		return fmt.Errorf("s3journal: marshal lease: %w", err)
+		return fmt.Errorf("s3store: marshal lease: %w", err)
 	}
 
 	in := &s3.PutObjectInput{
@@ -370,7 +507,7 @@ func (j *S3Journal) putLease(ctx context.Context, key string, rec leaseRecord, e
 	}
 
 	if _, err := j.client.PutObject(ctx, in); err != nil {
-		return fmt.Errorf("s3journal: put lease: %w", err)
+		return fmt.Errorf("s3store: put lease: %w", err)
 	}
 	return nil
 }
