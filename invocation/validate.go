@@ -17,16 +17,16 @@ func (i Invocation) Validate() error {
 		{"handler", i.Handler},
 		{"id", string(i.ID)},
 	} {
-		if err := validName(part.value); err != nil {
+		if err := ValidName(part.value); err != nil {
 			return fmt.Errorf("%s: %w", part.field, err)
 		}
 	}
 	return nil
 }
 
-// validName reports whether s is safe as one part of a key. It permits
+// ValidName reports whether s is safe as one part of a key. It permits
 // letters, digits, and the separators that read well in a path.
-func validName(s string) error {
+func ValidName(s string) error {
 	switch {
 	case s == "":
 		return fmt.Errorf("%w: empty", ErrInvalid)
