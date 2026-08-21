@@ -8,10 +8,10 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strings"
 
 	"github.com/keel/keel/engine"
 	"github.com/keel/keel/s3store"
+	"github.com/keel/keel/worker"
 )
 
 func main() {
@@ -19,13 +19,9 @@ func main() {
 	bucket := flag.String("bucket", "", "S3 bucket to store invocations in")
 	prefix := flag.String("prefix", "keel", "key prefix inside the bucket")
 	owner := flag.String("owner", "", "unique id for this engine in leases (default: hostname-pid)")
-	services := flag.String("services", "", "comma-separated name=url pairs, e.g. demo=http://localhost:8081/invoke")
 	flag.Parse()
 
-	svcMap, err := parseServices(*services)
-	if err != nil {
-		log.Fatal(err)
-	}
+	var err error
 	if *bucket == "" {
 		log.Fatal("-bucket is required")
 	}
@@ -40,14 +36,15 @@ func main() {
 		log.Fatalf("opening store: %v", err)
 	}
 
-	// One backend satisfies all three stores. This is the only place
-	// that knows which backend it is.
+	// One backend satisfies every durable store. This is the only place
+	// that knows which backend it is. The worker registry is not
+	// durable, because a lost registry costs one heartbeat and no work.
 	e, err := engine.New(engine.Config{
-		Records:  store,
-		Journal:  store,
-		Locker:   store,
-		Services: svcMap,
-		Owner:    *owner,
+		Records: store,
+		Journal: store,
+		Locker:  store,
+		Workers: worker.NewMemory(),
+		Owner:   *owner,
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -56,23 +53,6 @@ func main() {
 	srv := &server{engine: e}
 	log.Printf("keeld listening on %s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, srv.routes()))
-}
-
-// parseServices reads the name=url pairs that name every service the
-// engine may invoke.
-func parseServices(s string) (map[string]string, error) {
-	out := map[string]string{}
-	if s == "" {
-		return out, nil
-	}
-	for pair := range strings.SplitSeq(s, ",") {
-		name, url, ok := strings.Cut(pair, "=")
-		if !ok {
-			return nil, fmt.Errorf("invalid -services entry %q, want name=url", pair)
-		}
-		out[name] = url
-	}
-	return out, nil
 }
 
 // defaultOwner names this process. Two engines that share a bucket must

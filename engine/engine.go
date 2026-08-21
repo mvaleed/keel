@@ -15,29 +15,28 @@ import (
 	"github.com/keel/keel/invocation"
 	"github.com/keel/keel/journal"
 	"github.com/keel/keel/lease"
+	"github.com/keel/keel/worker"
 )
 
 // leaseTTL bounds how long a crashed engine keeps an invocation. It must
 // exceed one service call, but is downtime before another engine takes over.
 const leaseTTL = 2 * time.Minute
 
-var (
-	// ErrUnknownService is returned when no service hosts the handler.
-	// The engine must not record an invocation it cannot reach.
-	ErrUnknownService = errors.New("engine: unknown service")
+// invokePath is where a worker serves the engine. A worker announces a
+// base address, so the engine owns the path and the operator does not.
+const invokePath = "/keel/v1/invoke"
 
-	// ErrInputConflict is returned by Register when the address holds
-	// another input. The id is reused, and the caller must pick a new one.
-	ErrInputConflict = errors.New("engine: id registered with a different input")
-)
+// ErrInputConflict is returned by Register when the address holds
+// another input. The id is reused, and the caller must pick a new one.
+var ErrInputConflict = errors.New("engine: id registered with a different input")
 
-// Config holds what an Engine needs. One backend may satisfy all three
-// stores, and the engine must not know whether it does.
+// Config holds what an Engine needs. One backend may satisfy every
+// store, and the engine must not know whether it does.
 type Config struct {
-	Records  invocation.Store
-	Journal  journal.Store
-	Locker   lease.Locker
-	Services map[string]string // service name -> invoke URL
+	Records invocation.Store
+	Journal journal.Store
+	Locker  lease.Locker
+	Workers worker.Registry
 
 	// Owner identifies this engine in a lease. Two engines that share a
 	// store must not share an owner, or one takes the other's lease.
@@ -59,6 +58,8 @@ func New(cfg Config) (*Engine, error) {
 		return nil, errors.New("engine: nil journal store")
 	case cfg.Locker == nil:
 		return nil, errors.New("engine: nil locker")
+	case cfg.Workers == nil:
+		return nil, errors.New("engine: nil worker registry")
 	case cfg.Owner == "":
 		return nil, errors.New("engine: empty owner")
 	}
@@ -75,17 +76,13 @@ type Registration struct {
 // Register records that inv must run, and returns before it does. The
 // caller supplies the id, so a repeat of one call is not a second run.
 //
-// It returns ErrInputConflict when the address holds another input,
-// invocation.ErrInvalid for an address that cannot be stored, and
-// ErrUnknownService when no service hosts the handler.
+// It returns ErrInputConflict when the address holds another input, and
+// invocation.ErrInvalid for an address that cannot be stored. A service
+// with no live worker is accepted, because a worker may start later.
 func (e *Engine) Register(ctx context.Context, inv invocation.Invocation) (Registration, error) {
 	if err := inv.Validate(); err != nil {
 		return Registration{}, err
 	}
-	if _, ok := e.cfg.Services[inv.Service]; !ok {
-		return Registration{}, fmt.Errorf("%w %q", ErrUnknownService, inv.Service)
-	}
-
 	input, err := invocation.Compact(inv.Input)
 	if err != nil {
 		return Registration{}, err
@@ -131,6 +128,21 @@ func (e *Engine) Lookup(ctx context.Context, inv invocation.Invocation) (invocat
 	return e.cfg.Records.Get(ctx, inv.Key())
 }
 
+// RegisterWorker adds the worker, or keeps the one that has the same ID
+// live. It returns how long the worker may wait before it calls again.
+func (e *Engine) RegisterWorker(w worker.Worker) (time.Duration, error) {
+	if err := e.cfg.Workers.Register(w); err != nil {
+		return 0, err
+	}
+	return worker.Heartbeat, nil
+}
+
+// DeregisterWorker drops the worker, which it calls when it stops. It
+// is not an error to drop a worker the registry does not hold.
+func (e *Engine) DeregisterWorker(id string) error {
+	return e.cfg.Workers.Deregister(id)
+}
+
 // invokeRequest is what the engine sends a service to run, or resume,
 // one invocation.
 type invokeRequest struct {
@@ -154,11 +166,11 @@ func (e *Engine) Invoke(ctx context.Context, inv invocation.Invocation) (json.Ra
 	if err := inv.Validate(); err != nil {
 		return nil, err
 	}
-	url, ok := e.cfg.Services[inv.Service]
-	if !ok {
-		return nil, fmt.Errorf("%w %q", ErrUnknownService, inv.Service)
+	w, err := e.cfg.Workers.Pick(inv.Service, inv.Handler)
+	if err != nil {
+		return nil, fmt.Errorf("%s/%s: %w", inv.Service, inv.Handler, err)
 	}
-	return e.attempt(ctx, inv, url)
+	return e.attempt(ctx, inv, w.Address+invokePath)
 }
 
 // attempt is one try at an invocation: claim, replay, run, append,

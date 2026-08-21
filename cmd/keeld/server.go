@@ -10,17 +10,20 @@ import (
 
 	"github.com/keel/keel/engine"
 	"github.com/keel/keel/invocation"
+	"github.com/keel/keel/worker"
 )
 
 // maxRequestSize bounds one registration. The whole input goes to the
 // service in one request body, so it must stay small.
 const maxRequestSize = 1 << 20
 
-// A registrar records invocations. The server declares what it needs, so
-// a test needs no engine.
+// A registrar records invocations and workers. The server declares what
+// it needs, so a test needs no engine.
 type registrar interface {
 	Register(context.Context, invocation.Invocation) (engine.Registration, error)
 	Lookup(context.Context, invocation.Invocation) (invocation.Record, error)
+	RegisterWorker(worker.Worker) (time.Duration, error)
+	DeregisterWorker(id string) error
 }
 
 // server maps HTTP onto the engine. It holds no rule of its own, so the
@@ -33,6 +36,8 @@ func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/invocations", s.register)
 	mux.HandleFunc("GET /v1/invocations/{service}/{handler}/{id}", s.get)
+	mux.HandleFunc("POST /v1/workers", s.registerWorker)
+	mux.HandleFunc("DELETE /v1/workers/{id}", s.deregisterWorker)
 	return mux
 }
 
@@ -54,21 +59,41 @@ type invocationResponse struct {
 	CreatedAt time.Time         `json:"created_at"`
 }
 
-// register records the invocation and answers before anything runs it.
-func (s *server) register(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestSize+1))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "reading the request body")
-		return
-	}
-	if len(body) > maxRequestSize {
-		writeError(w, http.StatusRequestEntityTooLarge, "the request is larger than 1 MiB")
+// workerResponse tells a worker how long it may wait before it must
+// announce itself again.
+type workerResponse struct {
+	HeartbeatSeconds int `json:"heartbeat_seconds"`
+}
+
+// registerWorker adds the worker, or keeps a registered one live. One
+// route serves both, so a worker recovers from an engine restart.
+func (s *server) registerWorker(w http.ResponseWriter, r *http.Request) {
+	var req worker.Worker
+	if err := decode(w, r, &req); err != nil {
 		return
 	}
 
+	beat, err := s.engine.RegisterWorker(req)
+	if err != nil {
+		writeError(w, statusFor(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, workerResponse{HeartbeatSeconds: int(beat.Seconds())})
+}
+
+// deregisterWorker drops the worker, which it calls when it stops.
+func (s *server) deregisterWorker(w http.ResponseWriter, r *http.Request) {
+	if err := s.engine.DeregisterWorker(r.PathValue("id")); err != nil {
+		writeError(w, statusFor(err), err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// register records the invocation and answers before anything runs it.
+func (s *server) register(w http.ResponseWriter, r *http.Request) {
 	var req registerRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "the request is not valid JSON")
+	if err := decode(w, r, &req); err != nil {
 		return
 	}
 
@@ -112,15 +137,34 @@ func (s *server) get(w http.ResponseWriter, r *http.Request) {
 // place that knows both, so a new transport maps the same errors again.
 func statusFor(err error) int {
 	switch {
-	case errors.Is(err, invocation.ErrInvalid):
+	case errors.Is(err, invocation.ErrInvalid), errors.Is(err, worker.ErrInvalid):
 		return http.StatusBadRequest
-	case errors.Is(err, engine.ErrUnknownService), errors.Is(err, invocation.ErrNotFound):
+	case errors.Is(err, invocation.ErrNotFound):
 		return http.StatusNotFound
 	case errors.Is(err, engine.ErrInputConflict):
 		return http.StatusConflict
 	default:
 		return http.StatusInternalServerError
 	}
+}
+
+// decode reads one bounded JSON body into v. It answers the request
+// itself on failure, so a handler only returns.
+func decode(w http.ResponseWriter, r *http.Request, v any) error {
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestSize+1))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "reading the request body")
+		return err
+	}
+	if len(body) > maxRequestSize {
+		writeError(w, http.StatusRequestEntityTooLarge, "the request is larger than 1 MiB")
+		return errors.New("request too large")
+	}
+	if err := json.Unmarshal(body, v); err != nil {
+		writeError(w, http.StatusBadRequest, "the request is not valid JSON")
+		return err
+	}
+	return nil
 }
 
 func response(r invocation.Record) invocationResponse {

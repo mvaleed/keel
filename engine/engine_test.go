@@ -16,6 +16,7 @@ import (
 	"github.com/keel/keel/invocation"
 	"github.com/keel/keel/journal"
 	"github.com/keel/keel/lease"
+	"github.com/keel/keel/worker"
 )
 
 // fakeStore records what the engine appends, and serves a fixed history.
@@ -165,9 +166,18 @@ func inv(service, handler, id string, input json.RawMessage) invocation.Invocati
 func newEngine(t *testing.T, url string) (*engine.Engine, *fakeStore, *fakeLocker) {
 	t.Helper()
 	store, locker := &fakeStore{records: map[string]invocation.Record{}}, &fakeLocker{}
+	// A real registry, because it is in-process and holds no state that
+	// a fake would make simpler.
+	reg := worker.NewMemory()
+	if err := reg.Register(worker.Worker{
+		ID: "worker-1", Service: "demo",
+		Handlers: []string{"Charge", "Ship"}, Address: url,
+	}); err != nil {
+		t.Fatalf("registering the worker: %v", err)
+	}
 	e, err := engine.New(engine.Config{
 		Records: store, Journal: store, Locker: locker,
-		Services: map[string]string{"demo": url}, Owner: "engine-a",
+		Workers: reg, Owner: "engine-a",
 	})
 	if err != nil {
 		t.Fatalf("engine.New: %v", err)
@@ -175,12 +185,13 @@ func newEngine(t *testing.T, url string) (*engine.Engine, *fakeStore, *fakeLocke
 	return e, store, locker
 }
 
-func TestInvokeRejectsAnUnknownService(t *testing.T) {
+func TestInvokeNeedsALiveWorker(t *testing.T) {
 	t.Parallel()
 
 	e, _, locker := newEngine(t, "http://unused")
-	if _, err := e.Invoke(t.Context(), inv("missing", "Charge", "id-1", nil)); err == nil {
-		t.Fatal("Invoke returned nil, want an error")
+	_, err := e.Invoke(t.Context(), inv("missing", "Charge", "id-1", nil))
+	if !errors.Is(err, worker.ErrNoWorker) {
+		t.Fatalf("err = %v, want %v", err, worker.ErrNoWorker)
 	}
 	// The engine must not claim a lease it cannot use.
 	if claims, _ := locker.counts(); claims != 0 {
@@ -379,7 +390,10 @@ func TestInvokeFailsOnAnUndecodableReply(t *testing.T) {
 	t.Parallel()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Write([]byte("not json"))
+		_, err := w.Write([]byte("not json"))
+		if err != nil {
+			t.Fatalf("unable to write")
+		}
 	}))
 	t.Cleanup(srv.Close)
 
@@ -394,12 +408,16 @@ func TestNewRejectsAnIncompleteConfig(t *testing.T) {
 	t.Parallel()
 
 	store, locker := &fakeStore{}, &fakeLocker{}
-	full := engine.Config{Records: store, Journal: store, Locker: locker, Owner: "engine-a"}
+	full := engine.Config{
+		Records: store, Journal: store, Locker: locker,
+		Workers: worker.NewMemory(), Owner: "engine-a",
+	}
 
 	tests := map[string]func(*engine.Config){
 		"no records": func(c *engine.Config) { c.Records = nil },
 		"no journal": func(c *engine.Config) { c.Journal = nil },
 		"no locker":  func(c *engine.Config) { c.Locker = nil },
+		"no workers": func(c *engine.Config) { c.Workers = nil },
 		"no owner":   func(c *engine.Config) { c.Owner = "" },
 	}
 	for name, break_ := range tests {
@@ -516,7 +534,6 @@ func TestRegisterRejectsBadInvocations(t *testing.T) {
 		{"no id", inv("demo", "Charge", "", nil), invocation.ErrInvalid},
 		{"no handler", inv("demo", "", "order-1", nil), invocation.ErrInvalid},
 		{"traversing id", inv("demo", "Charge", "../../x", nil), invocation.ErrInvalid},
-		{"unknown service", inv("nope", "Charge", "order-1", nil), engine.ErrUnknownService},
 		{"input is not json", inv("demo", "Charge", "order-1", json.RawMessage(`{`)), invocation.ErrInvalid},
 	}
 	for _, tt := range tests {
@@ -575,5 +592,105 @@ func TestLookupRejectsBadAddresses(t *testing.T) {
 	}
 	if _, err := e.Lookup(t.Context(), inv("demo", "Charge", "never", nil)); !errors.Is(err, invocation.ErrNotFound) {
 		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestRegisterAcceptsAServiceWithNoWorker(t *testing.T) {
+	t.Parallel()
+
+	// No worker serves "later" yet. The invocation must still be
+	// recorded, because a worker may start after the registration.
+	e, store, _ := newEngine(t, "http://unused")
+	reg, err := e.Register(t.Context(), inv("later", "Charge", "order-1", nil))
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if !reg.Created {
+		t.Fatal("Created = false, want true")
+	}
+	if got := reg.Record.Status; got != invocation.Pending {
+		t.Fatalf("status = %q, want %q", got, invocation.Pending)
+	}
+	if len(store.records) != 1 {
+		t.Fatalf("records = %d, want 1", len(store.records))
+	}
+}
+
+func TestInvokeDialsThePickedWorker(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mu   sync.Mutex
+		path string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		path = r.URL.Path
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := w.Write([]byte(`{"output":{"ok":true}}`)); err != nil {
+			t.Errorf("writing reply: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	// The worker announces a base address only, so the engine must add
+	// the path of the invoke protocol itself.
+	e, _, _ := newEngine(t, srv.URL)
+	if _, err := e.Invoke(t.Context(), inv("demo", "Charge", "order-1", nil)); err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if path != "/keel/v1/invoke" {
+		t.Fatalf("path = %q, want %q", path, "/keel/v1/invoke")
+	}
+}
+
+func TestRegisterWorkerReachesTheRegistry(t *testing.T) {
+	t.Parallel()
+
+	e, _, _ := newEngine(t, "http://unused")
+	beat, err := e.RegisterWorker(worker.Worker{
+		ID: "worker-2", Service: "billing",
+		Handlers: []string{"Charge"}, Address: "http://localhost:9000",
+	})
+	if err != nil {
+		t.Fatalf("RegisterWorker: %v", err)
+	}
+	if beat != worker.Heartbeat {
+		t.Fatalf("heartbeat = %v, want %v", beat, worker.Heartbeat)
+	}
+
+	// The engine can now reach the service it could not reach before.
+	if _, err := e.Invoke(t.Context(), inv("billing", "Charge", "order-1", nil)); errors.Is(err, worker.ErrNoWorker) {
+		t.Fatal("Invoke returned ErrNoWorker after the worker registered")
+	}
+}
+
+func TestRegisterWorkerRejectsABadAddress(t *testing.T) {
+	t.Parallel()
+
+	e, _, _ := newEngine(t, "http://unused")
+	_, err := e.RegisterWorker(worker.Worker{
+		ID: "worker-3", Service: "billing",
+		Handlers: []string{"Charge"}, Address: "localhost:9000",
+	})
+	if !errors.Is(err, worker.ErrInvalid) {
+		t.Fatalf("err = %v, want %v", err, worker.ErrInvalid)
+	}
+}
+
+func TestDeregisterWorkerRemovesIt(t *testing.T) {
+	t.Parallel()
+
+	e, _, _ := newEngine(t, "http://unused")
+	if err := e.DeregisterWorker("worker-1"); err != nil {
+		t.Fatalf("DeregisterWorker: %v", err)
+	}
+	_, err := e.Invoke(t.Context(), inv("demo", "Charge", "order-1", nil))
+	if !errors.Is(err, worker.ErrNoWorker) {
+		t.Fatalf("err = %v, want %v", err, worker.ErrNoWorker)
 	}
 }

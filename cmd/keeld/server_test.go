@@ -12,15 +12,18 @@ import (
 
 	"github.com/keel/keel/engine"
 	"github.com/keel/keel/invocation"
+	"github.com/keel/keel/worker"
 )
 
 // fakeRegistrar stands in for the engine. The server holds no rule, so
 // every case here is about HTTP.
 type fakeRegistrar struct {
-	reg     engine.Registration
-	rec     invocation.Record
-	err     error
-	lastInv invocation.Invocation
+	reg        engine.Registration
+	rec        invocation.Record
+	err        error
+	lastInv    invocation.Invocation
+	lastWorker worker.Worker
+	dropped    string
 }
 
 func (f *fakeRegistrar) Register(_ context.Context, inv invocation.Invocation) (engine.Registration, error) {
@@ -39,6 +42,19 @@ func (f *fakeRegistrar) Lookup(_ context.Context, inv invocation.Invocation) (in
 	return f.rec, nil
 }
 
+func (f *fakeRegistrar) RegisterWorker(w worker.Worker) (time.Duration, error) {
+	f.lastWorker = w
+	if f.err != nil {
+		return 0, f.err
+	}
+	return worker.Heartbeat, nil
+}
+
+func (f *fakeRegistrar) DeregisterWorker(id string) error {
+	f.dropped = id
+	return f.err
+}
+
 func record() invocation.Record {
 	return invocation.Record{
 		Invocation: invocation.Invocation{
@@ -55,8 +71,13 @@ func newServer(reg *fakeRegistrar) http.Handler {
 
 func post(t *testing.T, h http.Handler, body string) *httptest.ResponseRecorder {
 	t.Helper()
+	return postTo(t, h, "/v1/invocations", body)
+}
+
+func postTo(t *testing.T, h http.Handler, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
 	w := httptest.NewRecorder()
-	h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/invocations", strings.NewReader(body)))
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, strings.NewReader(body)))
 	return w
 }
 
@@ -132,7 +153,6 @@ func TestRegisterMapsTheEngineErrors(t *testing.T) {
 		want int
 	}{
 		{"invalid", invocation.ErrInvalid, http.StatusBadRequest},
-		{"unknown service", engine.ErrUnknownService, http.StatusNotFound},
 		{"reused id", engine.ErrInputConflict, http.StatusConflict},
 		{"store failed", errors.New("bucket unreachable"), http.StatusInternalServerError},
 	}
@@ -219,21 +239,63 @@ func TestGetDoesNotServeATraversal(t *testing.T) {
 	}
 }
 
-func TestParseServices(t *testing.T) {
+func TestRegisterWorkerAnswersWithTheHeartbeat(t *testing.T) {
 	t.Parallel()
 
-	got, err := parseServices("a=http://a,b=http://b")
-	if err != nil {
-		t.Fatalf("parseServices: %v", err)
+	reg := &fakeRegistrar{}
+	w := postTo(t, newServer(reg), "/v1/workers",
+		`{"id":"w1","service":"demo","handlers":["Charge"],"address":"http://localhost:8081"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200: %s", w.Code, w.Body)
 	}
-	if got["a"] != "http://a" || got["b"] != "http://b" {
-		t.Fatalf("services = %v", got)
+
+	var got workerResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decoding the reply: %v", err)
 	}
-	if _, err := parseServices("broken"); err == nil {
-		t.Fatal("parseServices accepted an entry with no url")
+	// The SDK reads the interval from the engine, so it holds no copy.
+	if got.HeartbeatSeconds != int(worker.Heartbeat.Seconds()) {
+		t.Fatalf("heartbeat = %d, want %d", got.HeartbeatSeconds, int(worker.Heartbeat.Seconds()))
 	}
-	empty, err := parseServices("")
-	if err != nil || len(empty) != 0 {
-		t.Fatalf("parseServices(\"\") = %v, %v", empty, err)
+	if reg.lastWorker.ID != "w1" || reg.lastWorker.Address != "http://localhost:8081" {
+		t.Fatalf("worker = %+v", reg.lastWorker)
+	}
+}
+
+func TestRegisterWorkerMapsABadAnnouncement(t *testing.T) {
+	t.Parallel()
+
+	reg := &fakeRegistrar{err: worker.ErrInvalid}
+	w := postTo(t, newServer(reg), "/v1/workers", `{"id":"w1","service":"demo"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d, want 400: %s", w.Code, w.Body)
+	}
+}
+
+func TestRegisterWorkerRejectsAnUndecodableBody(t *testing.T) {
+	t.Parallel()
+
+	reg := &fakeRegistrar{}
+	w := postTo(t, newServer(reg), "/v1/workers", "{")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d, want 400", w.Code)
+	}
+	// A rejected body must not reach the engine.
+	if reg.lastWorker.ID != "" {
+		t.Fatalf("the engine got %+v", reg.lastWorker)
+	}
+}
+
+func TestDeregisterWorker(t *testing.T) {
+	t.Parallel()
+
+	reg := &fakeRegistrar{}
+	w := httptest.NewRecorder()
+	newServer(reg).ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/v1/workers/w1", nil))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("code = %d, want 204: %s", w.Code, w.Body)
+	}
+	if reg.dropped != "w1" {
+		t.Fatalf("dropped = %q, want %q", reg.dropped, "w1")
 	}
 }
