@@ -19,11 +19,11 @@ var (
 
 	// ErrExists is returned by Create when the address is taken. The
 	// caller must compare InputHash to tell a retry from a collision.
-	ErrExists = errors.New("invocation: already registered")
+	ErrExists = errors.New("invocation: already recorded")
 
 	// ErrNotFound is returned by Get for an address that was never
-	// registered.
-	ErrNotFound = errors.New("invocation: not registered")
+	// recorded.
+	ErrNotFound = errors.New("invocation: not recorded")
 )
 
 // A Status is the stage of one invocation. It is the only field of a
@@ -38,12 +38,12 @@ const (
 )
 
 // A Record is the durable statement that an invocation must run. It is
-// written once at registration, before the caller gets an answer.
+// written once on submission, before the caller gets an answer.
 type Record struct {
 	Invocation
 	Status Status `json:"status"`
 
-	// InputHash tells a retried registration from a reused id. It covers
+	// InputHash tells a retried submission from a reused id. It covers
 	// the compacted input, so whitespace alone does not make a conflict.
 	InputHash string    `json:"input_hash"`
 	CreatedAt time.Time `json:"created_at"`
@@ -53,7 +53,7 @@ type Record struct {
 // concurrency-safe.
 type Store interface {
 	// Create writes r once, and returns ErrExists if the address is
-	// taken. It must be a conditional write, because two registrations
+	// taken. It must be a conditional write, because two submissions
 	// of one address must not both succeed.
 	Create(ctx context.Context, r Record) error
 
@@ -80,7 +80,7 @@ func HashInput(input []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// Compact removes the whitespace from raw, so that two registrations
+// Compact removes the whitespace from raw, so that two submissions
 // that differ only in formatting hash the same. It returns nil for no
 // input, which makes an absent and an empty input one case.
 func Compact(raw json.RawMessage) (json.RawMessage, error) {

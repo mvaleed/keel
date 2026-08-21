@@ -15,10 +15,10 @@ import (
 	"github.com/keel/keel/worker"
 )
 
-// fakeRegistrar stands in for the engine. The server holds no rule, so
+// fakeCoordinator stands in for the engine. The server holds no rule, so
 // every case here is about HTTP.
-type fakeRegistrar struct {
-	reg        engine.Registration
+type fakeCoordinator struct {
+	sub        engine.Submission
 	rec        invocation.Record
 	err        error
 	lastInv    invocation.Invocation
@@ -26,15 +26,15 @@ type fakeRegistrar struct {
 	dropped    string
 }
 
-func (f *fakeRegistrar) Register(_ context.Context, inv invocation.Invocation) (engine.Registration, error) {
+func (f *fakeCoordinator) Submit(_ context.Context, inv invocation.Invocation) (engine.Submission, error) {
 	f.lastInv = inv
 	if f.err != nil {
-		return engine.Registration{}, f.err
+		return engine.Submission{}, f.err
 	}
-	return f.reg, nil
+	return f.sub, nil
 }
 
-func (f *fakeRegistrar) Lookup(_ context.Context, inv invocation.Invocation) (invocation.Record, error) {
+func (f *fakeCoordinator) Lookup(_ context.Context, inv invocation.Invocation) (invocation.Record, error) {
 	f.lastInv = inv
 	if f.err != nil {
 		return invocation.Record{}, f.err
@@ -42,7 +42,7 @@ func (f *fakeRegistrar) Lookup(_ context.Context, inv invocation.Invocation) (in
 	return f.rec, nil
 }
 
-func (f *fakeRegistrar) RegisterWorker(w worker.Worker) (time.Duration, error) {
+func (f *fakeCoordinator) RegisterWorker(w worker.Worker) (time.Duration, error) {
 	f.lastWorker = w
 	if f.err != nil {
 		return 0, f.err
@@ -50,7 +50,7 @@ func (f *fakeRegistrar) RegisterWorker(w worker.Worker) (time.Duration, error) {
 	return worker.Heartbeat, nil
 }
 
-func (f *fakeRegistrar) DeregisterWorker(id string) error {
+func (f *fakeCoordinator) DeregisterWorker(id string) error {
 	f.dropped = id
 	return f.err
 }
@@ -65,8 +65,8 @@ func record() invocation.Record {
 	}
 }
 
-func newServer(reg *fakeRegistrar) http.Handler {
-	return (&server{engine: reg}).routes()
+func newServer(c *fakeCoordinator) http.Handler {
+	return (&server{engine: c}).routes()
 }
 
 func post(t *testing.T, h http.Handler, body string) *httptest.ResponseRecorder {
@@ -90,11 +90,11 @@ func get(t *testing.T, h http.Handler, path string) *httptest.ResponseRecorder {
 
 const valid = `{"id":"order-1","service":"billing","handler":"Charge","input":{"amount":5}}`
 
-func TestRegisterAnswers202ForANewInvocation(t *testing.T) {
+func TestSubmitAnswers202ForANewInvocation(t *testing.T) {
 	t.Parallel()
 
-	reg := &fakeRegistrar{reg: engine.Registration{Record: record(), Created: true}}
-	w := post(t, newServer(reg), valid)
+	c := &fakeCoordinator{sub: engine.Submission{Record: record(), Created: true}}
+	w := post(t, newServer(c), valid)
 
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("code = %d, want 202: %s", w.Code, w.Body)
@@ -113,14 +113,14 @@ func TestRegisterAnswers202ForANewInvocation(t *testing.T) {
 	}
 }
 
-func TestRegisterPassesTheInvocationThrough(t *testing.T) {
+func TestSubmitPassesTheInvocationThrough(t *testing.T) {
 	t.Parallel()
 
-	reg := &fakeRegistrar{reg: engine.Registration{Record: record(), Created: true}}
-	post(t, newServer(reg), valid)
+	c := &fakeCoordinator{sub: engine.Submission{Record: record(), Created: true}}
+	post(t, newServer(c), valid)
 
 	// The body maps onto the invocation without the server reading it.
-	got := reg.lastInv
+	got := c.lastInv
 	if got.ID != "order-1" || got.Service != "billing" || got.Handler != "Charge" {
 		t.Fatalf("invocation = %+v", got)
 	}
@@ -129,11 +129,11 @@ func TestRegisterPassesTheInvocationThrough(t *testing.T) {
 	}
 }
 
-func TestRegisterAnswers200ForARepeat(t *testing.T) {
+func TestSubmitAnswers200ForARepeat(t *testing.T) {
 	t.Parallel()
 
-	reg := &fakeRegistrar{reg: engine.Registration{Record: record()}}
-	w := post(t, newServer(reg), valid)
+	c := &fakeCoordinator{sub: engine.Submission{Record: record()}}
+	w := post(t, newServer(c), valid)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("code = %d, want 200: %s", w.Code, w.Body)
@@ -144,7 +144,7 @@ func TestRegisterAnswers200ForARepeat(t *testing.T) {
 	}
 }
 
-func TestRegisterMapsTheEngineErrors(t *testing.T) {
+func TestSubmitMapsTheEngineErrors(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -159,7 +159,7 @@ func TestRegisterMapsTheEngineErrors(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			w := post(t, newServer(&fakeRegistrar{err: tt.err}), valid)
+			w := post(t, newServer(&fakeCoordinator{err: tt.err}), valid)
 			if w.Code != tt.want {
 				t.Fatalf("code = %d, want %d: %s", w.Code, tt.want, w.Body)
 			}
@@ -171,58 +171,58 @@ func TestRegisterMapsTheEngineErrors(t *testing.T) {
 	}
 }
 
-func TestRegisterRejectsAnUndecodableBody(t *testing.T) {
+func TestSubmitRejectsAnUndecodableBody(t *testing.T) {
 	t.Parallel()
 
-	reg := &fakeRegistrar{reg: engine.Registration{Record: record(), Created: true}}
-	if w := post(t, newServer(reg), `{`); w.Code != http.StatusBadRequest {
+	c := &fakeCoordinator{sub: engine.Submission{Record: record(), Created: true}}
+	if w := post(t, newServer(c), `{`); w.Code != http.StatusBadRequest {
 		t.Fatalf("code = %d, want 400", w.Code)
 	}
 	// A body the server cannot read must never reach the engine.
-	if reg.lastInv.Service != "" {
-		t.Fatalf("the engine saw %+v", reg.lastInv)
+	if c.lastInv.Service != "" {
+		t.Fatalf("the engine saw %+v", c.lastInv)
 	}
 }
 
-func TestRegisterRejectsAnOversizeBody(t *testing.T) {
+func TestSubmitRejectsAnOversizeBody(t *testing.T) {
 	t.Parallel()
 
-	reg := &fakeRegistrar{reg: engine.Registration{Record: record(), Created: true}}
+	c := &fakeCoordinator{sub: engine.Submission{Record: record(), Created: true}}
 	big := `{"id":"a","service":"billing","handler":"Charge","input":{"pad":"` +
 		strings.Repeat("x", maxRequestSize) + `"}}`
 
-	if w := post(t, newServer(reg), big); w.Code != http.StatusRequestEntityTooLarge {
+	if w := post(t, newServer(c), big); w.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("code = %d, want 413", w.Code)
 	}
-	if reg.lastInv.Service != "" {
-		t.Fatalf("the engine saw %+v", reg.lastInv)
+	if c.lastInv.Service != "" {
+		t.Fatalf("the engine saw %+v", c.lastInv)
 	}
 }
 
 func TestGetReturnsTheRecord(t *testing.T) {
 	t.Parallel()
 
-	reg := &fakeRegistrar{rec: record()}
-	w := get(t, newServer(reg), "/v1/invocations/billing/Charge/order-1")
+	c := &fakeCoordinator{rec: record()}
+	w := get(t, newServer(c), "/v1/invocations/billing/Charge/order-1")
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("code = %d, want 200: %s", w.Code, w.Body)
 	}
 	// The path maps onto the address the engine looks up.
-	if reg.lastInv.Key() != "billing/Charge/order-1" {
-		t.Fatalf("looked up %q", reg.lastInv.Key())
+	if c.lastInv.Key() != "billing/Charge/order-1" {
+		t.Fatalf("looked up %q", c.lastInv.Key())
 	}
 }
 
 func TestGetMapsTheEngineErrors(t *testing.T) {
 	t.Parallel()
 
-	reg := &fakeRegistrar{err: invocation.ErrNotFound}
-	if w := get(t, newServer(reg), "/v1/invocations/billing/Charge/never"); w.Code != http.StatusNotFound {
+	c := &fakeCoordinator{err: invocation.ErrNotFound}
+	if w := get(t, newServer(c), "/v1/invocations/billing/Charge/never"); w.Code != http.StatusNotFound {
 		t.Fatalf("code = %d, want 404", w.Code)
 	}
 
-	bad := &fakeRegistrar{err: invocation.ErrInvalid}
+	bad := &fakeCoordinator{err: invocation.ErrInvalid}
 	if w := get(t, newServer(bad), "/v1/invocations/billing/Charge/a%2Fb"); w.Code != http.StatusBadRequest {
 		t.Fatalf("code = %d, want 400", w.Code)
 	}
@@ -231,10 +231,10 @@ func TestGetMapsTheEngineErrors(t *testing.T) {
 func TestGetDoesNotServeATraversal(t *testing.T) {
 	t.Parallel()
 
-	reg := &fakeRegistrar{rec: record()}
+	c := &fakeCoordinator{rec: record()}
 	// The mux cleans the path before it matches, so a traversal never
 	// reaches a handler at all.
-	if w := get(t, newServer(reg), "/v1/invocations/billing/Charge/.."); w.Code == http.StatusOK {
+	if w := get(t, newServer(c), "/v1/invocations/billing/Charge/.."); w.Code == http.StatusOK {
 		t.Fatalf("code = %d, want anything but 200", w.Code)
 	}
 }
@@ -242,8 +242,8 @@ func TestGetDoesNotServeATraversal(t *testing.T) {
 func TestRegisterWorkerAnswersWithTheHeartbeat(t *testing.T) {
 	t.Parallel()
 
-	reg := &fakeRegistrar{}
-	w := postTo(t, newServer(reg), "/v1/workers",
+	c := &fakeCoordinator{}
+	w := postTo(t, newServer(c), "/v1/workers",
 		`{"id":"w1","service":"demo","handlers":["Charge"],"address":"http://localhost:8081"}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("code = %d, want 200: %s", w.Code, w.Body)
@@ -257,16 +257,16 @@ func TestRegisterWorkerAnswersWithTheHeartbeat(t *testing.T) {
 	if got.HeartbeatSeconds != int(worker.Heartbeat.Seconds()) {
 		t.Fatalf("heartbeat = %d, want %d", got.HeartbeatSeconds, int(worker.Heartbeat.Seconds()))
 	}
-	if reg.lastWorker.ID != "w1" || reg.lastWorker.Address != "http://localhost:8081" {
-		t.Fatalf("worker = %+v", reg.lastWorker)
+	if c.lastWorker.ID != "w1" || c.lastWorker.Address != "http://localhost:8081" {
+		t.Fatalf("worker = %+v", c.lastWorker)
 	}
 }
 
 func TestRegisterWorkerMapsABadAnnouncement(t *testing.T) {
 	t.Parallel()
 
-	reg := &fakeRegistrar{err: worker.ErrInvalid}
-	w := postTo(t, newServer(reg), "/v1/workers", `{"id":"w1","service":"demo"}`)
+	c := &fakeCoordinator{err: worker.ErrInvalid}
+	w := postTo(t, newServer(c), "/v1/workers", `{"id":"w1","service":"demo"}`)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("code = %d, want 400: %s", w.Code, w.Body)
 	}
@@ -275,27 +275,27 @@ func TestRegisterWorkerMapsABadAnnouncement(t *testing.T) {
 func TestRegisterWorkerRejectsAnUndecodableBody(t *testing.T) {
 	t.Parallel()
 
-	reg := &fakeRegistrar{}
-	w := postTo(t, newServer(reg), "/v1/workers", "{")
+	c := &fakeCoordinator{}
+	w := postTo(t, newServer(c), "/v1/workers", "{")
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("code = %d, want 400", w.Code)
 	}
 	// A rejected body must not reach the engine.
-	if reg.lastWorker.ID != "" {
-		t.Fatalf("the engine got %+v", reg.lastWorker)
+	if c.lastWorker.ID != "" {
+		t.Fatalf("the engine got %+v", c.lastWorker)
 	}
 }
 
 func TestDeregisterWorker(t *testing.T) {
 	t.Parallel()
 
-	reg := &fakeRegistrar{}
+	c := &fakeCoordinator{}
 	w := httptest.NewRecorder()
-	newServer(reg).ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/v1/workers/w1", nil))
+	newServer(c).ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/v1/workers/w1", nil))
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("code = %d, want 204: %s", w.Code, w.Body)
 	}
-	if reg.dropped != "w1" {
-		t.Fatalf("dropped = %q, want %q", reg.dropped, "w1")
+	if c.dropped != "w1" {
+		t.Fatalf("dropped = %q, want %q", c.dropped, "w1")
 	}
 }

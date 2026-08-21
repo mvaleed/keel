@@ -13,37 +13,47 @@ import (
 	"github.com/keel/keel/worker"
 )
 
-// maxRequestSize bounds one registration. The whole input goes to the
-// service in one request body, so it must stay small.
+// maxRequestSize bounds one submission. The whole input goes to the
+// worker in one request body, so it must stay small.
 const maxRequestSize = 1 << 20
 
-// A registrar records invocations and workers. The server declares what
-// it needs, so a test needs no engine.
-type registrar interface {
-	Register(context.Context, invocation.Invocation) (engine.Registration, error)
+// invocations is the half of the engine that answers a client.
+type invocations interface {
+	Submit(context.Context, invocation.Invocation) (engine.Submission, error)
 	Lookup(context.Context, invocation.Invocation) (invocation.Record, error)
+}
+
+// workers is the half of the engine that answers a worker.
+type workers interface {
 	RegisterWorker(worker.Worker) (time.Duration, error)
 	DeregisterWorker(id string) error
+}
+
+// A coordinator is what the server needs of the engine. The server
+// declares it, so a test needs no engine to exercise a route.
+type coordinator interface {
+	invocations
+	workers
 }
 
 // server maps HTTP onto the engine. It holds no rule of its own, so the
 // SDK protocol can reach the same rules another way.
 type server struct {
-	engine registrar
+	engine coordinator
 }
 
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/invocations", s.register)
+	mux.HandleFunc("POST /v1/invocations", s.submit)
 	mux.HandleFunc("GET /v1/invocations/{service}/{handler}/{id}", s.get)
 	mux.HandleFunc("POST /v1/workers", s.registerWorker)
 	mux.HandleFunc("DELETE /v1/workers/{id}", s.deregisterWorker)
 	return mux
 }
 
-// registerRequest is the body a client sends to register an invocation.
-// The client supplies the id, which makes a retry safe to repeat.
-type registerRequest struct {
+// submitRequest is the body a client sends to submit an invocation. The
+// client supplies the id, which makes a retry safe to repeat.
+type submitRequest struct {
 	ID      string          `json:"id"`
 	Service string          `json:"service"`
 	Handler string          `json:"handler"`
@@ -90,14 +100,14 @@ func (s *server) deregisterWorker(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// register records the invocation and answers before anything runs it.
-func (s *server) register(w http.ResponseWriter, r *http.Request) {
-	var req registerRequest
+// submit records the invocation and answers before anything runs it.
+func (s *server) submit(w http.ResponseWriter, r *http.Request) {
+	var req submitRequest
 	if err := decode(w, r, &req); err != nil {
 		return
 	}
 
-	reg, err := s.engine.Register(r.Context(), invocation.Invocation{
+	sub, err := s.engine.Submit(r.Context(), invocation.Invocation{
 		ID:      invocation.ID(req.ID),
 		Service: req.Service,
 		Handler: req.Handler,
@@ -108,14 +118,14 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A repeat of a registration is not a new invocation, and the code
-	// is what tells the client which one it got.
+	// A repeat of a submission is not a new invocation, and the code is
+	// what tells the client which one it got.
 	code := http.StatusOK
-	if reg.Created {
+	if sub.Created {
 		code = http.StatusAccepted
-		w.Header().Set("Location", "/v1/invocations/"+reg.Record.Key())
+		w.Header().Set("Location", "/v1/invocations/"+sub.Record.Key())
 	}
-	writeJSON(w, code, response(reg.Record))
+	writeJSON(w, code, response(sub.Record))
 }
 
 // get returns the recorded invocation, which a client polls because

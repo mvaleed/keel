@@ -1,4 +1,4 @@
-// Package engine owns the rules of an invocation: how one is registered,
+// Package engine owns the rules of an invocation: how one is submitted,
 // and how one runs. A transport decodes a request and calls the engine;
 // it must not hold a rule of its own, or a second transport repeats it.
 package engine
@@ -26,9 +26,9 @@ const leaseTTL = 2 * time.Minute
 // base address, so the engine owns the path and the operator does not.
 const invokePath = "/keel/v1/invoke"
 
-// ErrInputConflict is returned by Register when the address holds
+// ErrInputConflict is returned by Submit when the address holds
 // another input. The id is reused, and the caller must pick a new one.
-var ErrInputConflict = errors.New("engine: id registered with a different input")
+var ErrInputConflict = errors.New("engine: id submitted with a different input")
 
 // Config holds what an Engine needs. One backend may satisfy every
 // store, and the engine must not know whether it does.
@@ -43,7 +43,8 @@ type Config struct {
 	Owner string
 }
 
-// Engine registers invocations, and runs the ones a dispatcher gives it.
+// Engine records the invocations a client submits, and runs the ones a
+// dispatcher gives it.
 type Engine struct {
 	cfg Config
 }
@@ -66,26 +67,26 @@ func New(cfg Config) (*Engine, error) {
 	return &Engine{cfg: cfg}, nil
 }
 
-// A Registration is the answer to Register. Created is false when the
-// call repeated a registration that already existed.
-type Registration struct {
+// A Submission is the answer to Submit. Created is false when the call
+// repeated a submission that already existed.
+type Submission struct {
 	Record  invocation.Record
 	Created bool
 }
 
-// Register records that inv must run, and returns before it does. The
+// Submit records that inv must run, and returns before it does. The
 // caller supplies the id, so a repeat of one call is not a second run.
 //
 // It returns ErrInputConflict when the address holds another input, and
 // invocation.ErrInvalid for an address that cannot be stored. A service
 // with no live worker is accepted, because a worker may start later.
-func (e *Engine) Register(ctx context.Context, inv invocation.Invocation) (Registration, error) {
+func (e *Engine) Submit(ctx context.Context, inv invocation.Invocation) (Submission, error) {
 	if err := inv.Validate(); err != nil {
-		return Registration{}, err
+		return Submission{}, err
 	}
 	input, err := invocation.Compact(inv.Input)
 	if err != nil {
-		return Registration{}, err
+		return Submission{}, err
 	}
 	inv.Input = input
 
@@ -98,29 +99,29 @@ func (e *Engine) Register(ctx context.Context, inv invocation.Invocation) (Regis
 
 	switch err := e.cfg.Records.Create(ctx, rec); {
 	case err == nil:
-		return Registration{Record: rec, Created: true}, nil
+		return Submission{Record: rec, Created: true}, nil
 	case errors.Is(err, invocation.ErrExists):
 		return e.repeat(ctx, rec)
 	default:
-		return Registration{}, err
+		return Submission{}, err
 	}
 }
 
-// repeat answers a Register whose address is taken. The same input is a
+// repeat answers a Submit whose address is taken. The same input is a
 // retry, and another input is an id that two invocations want.
-func (e *Engine) repeat(ctx context.Context, want invocation.Record) (Registration, error) {
+func (e *Engine) repeat(ctx context.Context, want invocation.Record) (Submission, error) {
 	got, err := e.cfg.Records.Get(ctx, want.Key())
 	if err != nil {
-		return Registration{}, err
+		return Submission{}, err
 	}
 	if got.InputHash != want.InputHash {
-		return Registration{}, fmt.Errorf("%w: %s", ErrInputConflict, want.Key())
+		return Submission{}, fmt.Errorf("%w: %s", ErrInputConflict, want.Key())
 	}
-	return Registration{Record: got}, nil
+	return Submission{Record: got}, nil
 }
 
 // Lookup returns the recorded invocation, and invocation.ErrNotFound if
-// there is none. A caller polls it, because Register does not wait.
+// there is none. A caller polls it, because Submit does not wait.
 func (e *Engine) Lookup(ctx context.Context, inv invocation.Invocation) (invocation.Record, error) {
 	if err := inv.Validate(); err != nil {
 		return invocation.Record{}, err

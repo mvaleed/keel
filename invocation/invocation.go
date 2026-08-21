@@ -9,7 +9,7 @@ import (
 
 // An Invocation names one run of a handler that a service hosts. The ID
 // comes from the caller, because a resume must name the run that
-// already exists, and a retried registration must not start a new one.
+// already exists, and a retried submission must not start a new one.
 type Invocation struct {
 	ID      ID              `json:"id"`
 	Service string          `json:"service"`

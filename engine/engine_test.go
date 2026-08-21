@@ -436,48 +436,48 @@ func TestNewRejectsAnIncompleteConfig(t *testing.T) {
 	}
 }
 
-func TestRegisterRecordsAPendingInvocation(t *testing.T) {
+func TestSubmitRecordsAPendingInvocation(t *testing.T) {
 	t.Parallel()
 
 	e, store, locker := newEngine(t, "http://unused")
-	reg, err := e.Register(t.Context(), inv("demo", "Charge", "order-1", json.RawMessage(`{"amount":5}`)))
+	sub, err := e.Submit(t.Context(), inv("demo", "Charge", "order-1", json.RawMessage(`{"amount":5}`)))
 	if err != nil {
-		t.Fatalf("Register: %v", err)
+		t.Fatalf("Submit: %v", err)
 	}
 
-	if !reg.Created {
+	if !sub.Created {
 		t.Fatal("Created is false for a new invocation")
 	}
-	if reg.Record.Status != invocation.Pending {
-		t.Fatalf("status = %q, want pending", reg.Record.Status)
+	if sub.Record.Status != invocation.Pending {
+		t.Fatalf("status = %q, want pending", sub.Record.Status)
 	}
-	if reg.Record.CreatedAt.IsZero() {
+	if sub.Record.CreatedAt.IsZero() {
 		t.Fatal("CreatedAt is zero")
 	}
 	if _, ok := store.records["demo/Charge/order-1"]; !ok {
 		t.Fatalf("stored %v, want demo/Charge/order-1", store.records)
 	}
-	// Registration records the invocation; it must not start it.
+	// Submission records the invocation; it must not start it.
 	if claims, _ := locker.counts(); claims != 0 {
 		t.Fatalf("claims = %d, want 0", claims)
 	}
 }
 
-func TestRegisterIsIdempotent(t *testing.T) {
+func TestSubmitIsIdempotent(t *testing.T) {
 	t.Parallel()
 
 	e, store, _ := newEngine(t, "http://unused")
 	in := inv("demo", "Charge", "order-1", json.RawMessage(`{"amount":5}`))
 
-	first, err := e.Register(t.Context(), in)
+	first, err := e.Submit(t.Context(), in)
 	if err != nil {
-		t.Fatalf("first Register: %v", err)
+		t.Fatalf("first Submit: %v", err)
 	}
 
 	// A retry must find the invocation, not start a second run of it.
-	second, err := e.Register(t.Context(), in)
+	second, err := e.Submit(t.Context(), in)
 	if err != nil {
-		t.Fatalf("second Register: %v", err)
+		t.Fatalf("second Submit: %v", err)
 	}
 	if second.Created {
 		t.Fatal("Created is true for a repeat")
@@ -490,40 +490,40 @@ func TestRegisterIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestRegisterIgnoresInputWhitespace(t *testing.T) {
+func TestSubmitIgnoresInputWhitespace(t *testing.T) {
 	t.Parallel()
 
 	e, _, _ := newEngine(t, "http://unused")
-	if _, err := e.Register(t.Context(), inv("demo", "Charge", "order-1", json.RawMessage(`{"amount":5}`))); err != nil {
-		t.Fatalf("Register: %v", err)
+	if _, err := e.Submit(t.Context(), inv("demo", "Charge", "order-1", json.RawMessage(`{"amount":5}`))); err != nil {
+		t.Fatalf("Submit: %v", err)
 	}
 
 	// Formatting alone must not look like a conflict.
 	spaced := inv("demo", "Charge", "order-1", json.RawMessage("{ \"amount\" :\n5 }"))
-	reg, err := e.Register(t.Context(), spaced)
+	sub, err := e.Submit(t.Context(), spaced)
 	if err != nil {
-		t.Fatalf("Register with spacing: %v", err)
+		t.Fatalf("Submit with spacing: %v", err)
 	}
-	if reg.Created {
+	if sub.Created {
 		t.Fatal("Created is true for a reformatted repeat")
 	}
 }
 
-func TestRegisterRejectsAReusedID(t *testing.T) {
+func TestSubmitRejectsAReusedID(t *testing.T) {
 	t.Parallel()
 
 	e, _, _ := newEngine(t, "http://unused")
-	if _, err := e.Register(t.Context(), inv("demo", "Charge", "order-1", json.RawMessage(`{"amount":5}`))); err != nil {
-		t.Fatalf("Register: %v", err)
+	if _, err := e.Submit(t.Context(), inv("demo", "Charge", "order-1", json.RawMessage(`{"amount":5}`))); err != nil {
+		t.Fatalf("Submit: %v", err)
 	}
 
 	other := inv("demo", "Charge", "order-1", json.RawMessage(`{"amount":9999}`))
-	if _, err := e.Register(t.Context(), other); !errors.Is(err, engine.ErrInputConflict) {
+	if _, err := e.Submit(t.Context(), other); !errors.Is(err, engine.ErrInputConflict) {
 		t.Fatalf("err = %v, want ErrInputConflict", err)
 	}
 }
 
-func TestRegisterRejectsBadInvocations(t *testing.T) {
+func TestSubmitRejectsBadInvocations(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -540,10 +540,10 @@ func TestRegisterRejectsBadInvocations(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			e, store, _ := newEngine(t, "http://unused")
-			if _, err := e.Register(t.Context(), tt.in); !errors.Is(err, tt.want) {
+			if _, err := e.Submit(t.Context(), tt.in); !errors.Is(err, tt.want) {
 				t.Fatalf("err = %v, want %v", err, tt.want)
 			}
-			// A rejected registration must record nothing.
+			// A rejected submission must record nothing.
 			if len(store.records) != 0 {
 				t.Fatalf("stored %d records, want 0", len(store.records))
 			}
@@ -551,14 +551,14 @@ func TestRegisterRejectsBadInvocations(t *testing.T) {
 	}
 }
 
-func TestRegisterReportsAStoreFailure(t *testing.T) {
+func TestSubmitReportsAStoreFailure(t *testing.T) {
 	t.Parallel()
 
 	e, store, _ := newEngine(t, "http://unused")
 	store.createErr = errors.New("bucket unreachable")
 
 	// The caller must never be told a record is durable when it is not.
-	_, err := e.Register(t.Context(), inv("demo", "Charge", "order-1", nil))
+	_, err := e.Submit(t.Context(), inv("demo", "Charge", "order-1", nil))
 	if err == nil || !strings.Contains(err.Error(), "bucket unreachable") {
 		t.Fatalf("err = %v, want the store error", err)
 	}
@@ -569,8 +569,8 @@ func TestLookup(t *testing.T) {
 
 	e, _, _ := newEngine(t, "http://unused")
 	in := inv("demo", "Charge", "order-1", json.RawMessage(`{"a":1}`))
-	if _, err := e.Register(t.Context(), in); err != nil {
-		t.Fatalf("Register: %v", err)
+	if _, err := e.Submit(t.Context(), in); err != nil {
+		t.Fatalf("Submit: %v", err)
 	}
 
 	got, err := e.Lookup(t.Context(), in)
@@ -595,20 +595,20 @@ func TestLookupRejectsBadAddresses(t *testing.T) {
 	}
 }
 
-func TestRegisterAcceptsAServiceWithNoWorker(t *testing.T) {
+func TestSubmitAcceptsAServiceWithNoWorker(t *testing.T) {
 	t.Parallel()
 
 	// No worker serves "later" yet. The invocation must still be
-	// recorded, because a worker may start after the registration.
+	// recorded, because a worker may start after the submission.
 	e, store, _ := newEngine(t, "http://unused")
-	reg, err := e.Register(t.Context(), inv("later", "Charge", "order-1", nil))
+	sub, err := e.Submit(t.Context(), inv("later", "Charge", "order-1", nil))
 	if err != nil {
-		t.Fatalf("Register: %v", err)
+		t.Fatalf("Submit: %v", err)
 	}
-	if !reg.Created {
+	if !sub.Created {
 		t.Fatal("Created = false, want true")
 	}
-	if got := reg.Record.Status; got != invocation.Pending {
+	if got := sub.Record.Status; got != invocation.Pending {
 		t.Fatalf("status = %q, want %q", got, invocation.Pending)
 	}
 	if len(store.records) != 1 {
