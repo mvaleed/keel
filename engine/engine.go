@@ -1,50 +1,42 @@
-// Package engine owns the rules of an invocation: how one is submitted,
-// and how one runs. A transport decodes a request and calls the engine;
-// it must not hold a rule of its own, or a second transport repeats it.
+// Package engine owns the rules of a submission: what a client may ask
+// for, and what it is told. A transport decodes a request and calls the
+// engine; it must not hold a rule of its own, or a second transport
+// repeats it. Package dispatch runs what this package records.
 package engine
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"time"
 
 	"github.com/keel/keel/invocation"
-	"github.com/keel/keel/journal"
-	"github.com/keel/keel/lease"
 	"github.com/keel/keel/worker"
 )
 
-// leaseTTL bounds how long a crashed engine keeps an invocation. It must
-// exceed one service call, but is downtime before another engine takes over.
-const leaseTTL = 2 * time.Minute
-
-// invokePath is where a worker serves the engine. A worker announces a
-// base address, so the engine owns the path and the operator does not.
-const invokePath = "/keel/v1/invoke"
-
-// ErrInputConflict is returned by Submit when the address holds
-// another input. The id is reused, and the caller must pick a new one.
+// ErrInputConflict is returned by Submit when the address holds another
+// input. The id is reused, and the caller must pick a new one.
 var ErrInputConflict = errors.New("engine: id submitted with a different input")
+
+// A Dispatcher learns that an invocation is due, so a submission need
+// not wait for the next scan. Notify must not block.
+type Dispatcher interface {
+	Notify(m invocation.WakeupMarker)
+}
 
 // Config holds what an Engine needs. One backend may satisfy every
 // store, and the engine must not know whether it does.
 type Config struct {
 	Records invocation.Store
-	Journal journal.Store
-	Locker  lease.Locker
 	Workers worker.Registry
 
-	// Owner identifies this engine in a lease. Two engines that share a
-	// store must not share an owner, or one takes the other's lease.
-	Owner string
+	// Dispatcher takes a new marker at once. It may be nil, because the
+	// handoff is latency and never correctness.
+	Dispatcher Dispatcher
 }
 
-// Engine records the invocations a client submits, and runs the ones a
-// dispatcher gives it.
+// Engine records the invocations a client submits, and answers the
+// questions a client asks about them.
 type Engine struct {
 	cfg Config
 }
@@ -55,14 +47,8 @@ func New(cfg Config) (*Engine, error) {
 	switch {
 	case cfg.Records == nil:
 		return nil, errors.New("engine: nil record store")
-	case cfg.Journal == nil:
-		return nil, errors.New("engine: nil journal store")
-	case cfg.Locker == nil:
-		return nil, errors.New("engine: nil locker")
 	case cfg.Workers == nil:
 		return nil, errors.New("engine: nil worker registry")
-	case cfg.Owner == "":
-		return nil, errors.New("engine: empty owner")
 	}
 	return &Engine{cfg: cfg}, nil
 }
@@ -99,17 +85,26 @@ func (e *Engine) Submit(ctx context.Context, inv invocation.Invocation) (Submiss
 
 	switch err := e.cfg.Records.Create(ctx, rec); {
 	case err == nil:
+		e.notify(invocation.WakeupMarker{Key: rec.Key(), Due: rec.CreatedAt})
 		return Submission{Record: rec, Created: true}, nil
 	case errors.Is(err, invocation.ErrExists):
-		return e.repeat(ctx, rec)
+		return e.settleDuplicate(ctx, rec)
 	default:
 		return Submission{}, err
 	}
 }
 
-// repeat answers a Submit whose address is taken. The same input is a
-// retry, and another input is an id that two invocations want.
-func (e *Engine) repeat(ctx context.Context, want invocation.Record) (Submission, error) {
+// notify hands a marker to the dispatcher. An absent dispatcher is not
+// an error, because the next scan finds the marker anyway.
+func (e *Engine) notify(m invocation.WakeupMarker) {
+	if e.cfg.Dispatcher != nil {
+		e.cfg.Dispatcher.Notify(m)
+	}
+}
+
+// settleDuplicate answers a Submit whose address is taken. The same
+// input is a retry, and another input is an id that two callers want.
+func (e *Engine) settleDuplicate(ctx context.Context, want invocation.Record) (Submission, error) {
 	got, err := e.cfg.Records.Get(ctx, want.Key())
 	if err != nil {
 		return Submission{}, err
@@ -142,109 +137,4 @@ func (e *Engine) RegisterWorker(w worker.Worker) (time.Duration, error) {
 // is not an error to drop a worker the registry does not hold.
 func (e *Engine) DeregisterWorker(id string) error {
 	return e.cfg.Workers.Deregister(id)
-}
-
-// invokeRequest is what the engine sends a service to run, or resume,
-// one invocation.
-type invokeRequest struct {
-	InvocationID string          `json:"invocation_id"`
-	Handler      string          `json:"handler"`
-	Input        json.RawMessage `json:"input"`
-	Journal      []journal.Entry `json:"journal"`
-}
-
-// invokeResponse is a service's reply. NewEntries are the steps it ran,
-// which the engine persists before it returns Output to the caller.
-type invokeResponse struct {
-	Output     json.RawMessage `json:"output,omitempty"`
-	Error      string          `json:"error,omitempty"`
-	NewEntries []journal.Entry `json:"new_entries,omitempty"`
-}
-
-// Invoke runs, or resumes, inv. It hands the journal to the service that
-// hosts the handler, and appends the new steps the service ran.
-func (e *Engine) Invoke(ctx context.Context, inv invocation.Invocation) (json.RawMessage, error) {
-	if err := inv.Validate(); err != nil {
-		return nil, err
-	}
-	w, err := e.cfg.Workers.Pick(inv.Service, inv.Handler)
-	if err != nil {
-		return nil, fmt.Errorf("%s/%s: %w", inv.Service, inv.Handler, err)
-	}
-	return e.attempt(ctx, inv, w.Address+invokePath)
-}
-
-// attempt is one try at an invocation: claim, replay, run, append,
-// release. It ends when the service replies or the lease is lost.
-func (e *Engine) attempt(ctx context.Context, inv invocation.Invocation, url string) (json.RawMessage, error) {
-	key := inv.Key()
-
-	// Claim before reading, so the history stays stable and a second
-	// engine cannot drive the same invocation.
-	l, err := e.cfg.Locker.Claim(ctx, key, e.cfg.Owner, leaseTTL)
-	if err != nil {
-		return nil, fmt.Errorf("claiming %s: %w", key, err)
-	}
-	defer func() {
-		_ = e.cfg.Locker.Release(ctx, l)
-	}()
-
-	// The whole history goes in one request body, so collect it eagerly.
-	// Read is an iterator so this can become a stream later.
-	history, err := journal.Collect(e.cfg.Journal.Read(ctx, key))
-	if err != nil {
-		return nil, err
-	}
-
-	out, err := e.call(ctx, url, invokeRequest{
-		InvocationID: string(inv.ID),
-		Handler:      inv.Handler,
-		Input:        inv.Input,
-		Journal:      history,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	for _, entry := range out.NewEntries {
-		// A lost lease means another engine took the invocation over.
-		// Stop, or the remaining steps interleave into its journal.
-		if err := e.cfg.Journal.Append(ctx, key, l.Epoch, entry); err != nil {
-			if errors.Is(err, lease.ErrLeaseLost) {
-				return nil, fmt.Errorf("lost %s mid-invocation: %w", key, err)
-			}
-			return nil, err
-		}
-	}
-
-	if out.Error != "" {
-		return nil, fmt.Errorf("%s", out.Error)
-	}
-	return out.Output, nil
-}
-
-// call posts one invoke request to a service and decodes its reply.
-func (e *Engine) call(ctx context.Context, url string, body invokeRequest) (*invokeResponse, error) {
-	reqBody, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(reqBody))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("calling %q: %w", url, err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	var out invokeResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, fmt.Errorf("decoding response from %q: %w", url, err)
-	}
-	return &out, nil
 }
