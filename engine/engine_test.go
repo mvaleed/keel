@@ -69,6 +69,16 @@ func (f *fakeStore) Get(_ context.Context, key string) (invocation.Record, error
 	return r, nil
 }
 
+func (f *fakeStore) Update(_ context.Context, r invocation.Record) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.records[r.Key()]; !ok {
+		return invocation.ErrNotFound
+	}
+	f.records[r.Key()] = r
+	return nil
+}
+
 func (f *fakeStore) Read(context.Context, string) iter.Seq2[journal.Entry, error] {
 	return func(yield func(journal.Entry, error) bool) {
 		f.mu.Lock()

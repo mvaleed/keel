@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"iter"
 	"time"
+
+	"github.com/keel/keel/lease"
 )
 
 var (
@@ -26,8 +28,7 @@ var (
 	ErrNotFound = errors.New("invocation: not recorded")
 )
 
-// A Status is the stage of one invocation. It is the only field of a
-// Record that ever changes after Create.
+// A Status is the stage of one invocation.
 type Status string
 
 const (
@@ -36,6 +37,12 @@ const (
 	Succeeded Status = "succeeded"
 	Failed    Status = "failed"
 )
+
+// Terminal reports whether the status is final. A terminal invocation
+// never runs again, so a dispatcher drops its marker.
+func (s Status) Terminal() bool {
+	return s == Succeeded || s == Failed
+}
 
 // A Record is the durable statement that an invocation must run. It is
 // written once on submission, before the caller gets an answer.
@@ -47,6 +54,22 @@ type Record struct {
 	// the compacted input, so whitespace alone does not make a conflict.
 	InputHash string    `json:"input_hash"`
 	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
+
+	// Epoch is the lease epoch of the holder that wrote this record. A
+	// write that carries a lower epoch comes from a stale holder.
+	Epoch lease.Epoch `json:"epoch,omitempty"`
+
+	// Attempts counts the runs that reached a worker. A run that found
+	// no worker is not an attempt.
+	Attempts int `json:"attempts,omitempty"`
+
+	// Failures counts the runs in a row that made no progress. It drives
+	// the backoff, and any progress resets it to zero.
+	Failures int `json:"failures,omitempty"`
+
+	Output json.RawMessage `json:"output,omitempty"`
+	Error  string          `json:"error,omitempty"`
 }
 
 // A Store keeps the invocation records. Implementations must be
@@ -59,18 +82,32 @@ type Store interface {
 
 	// Get returns the record at key, and ErrNotFound if there is none.
 	Get(ctx context.Context, key string) (Record, error)
+
+	// Update replaces the record. It returns lease.ErrLeaseLost when the
+	// stored record carries a later epoch, because a stale holder wrote it.
+	Update(ctx context.Context, r Record) error
 }
 
-// A PendingIndex lists the invocations that still need to run. It is
-// separate from Store, because only a dispatcher reads it.
-type PendingIndex interface {
-	// Pending yields the key of every invocation that is not dispatched.
-	// The order is unspecified.
-	Pending(ctx context.Context) iter.Seq2[string, error]
+// A WakeupMarker says an invocation must be looked at again at a time.
+// The due time is part of the key, so a scan reads only the listing.
+type WakeupMarker struct {
+	Key string
+	Due time.Time
+}
 
-	// ClearPending drops key from the index. Clearing a key that is not
-	// in the index is not an error.
-	ClearPending(ctx context.Context, key string) error
+// A DueIndex holds the time each unfinished invocation is next due. It
+// is separate from Store, because only a dispatcher reads it.
+type DueIndex interface {
+	// Schedule writes a marker that falls due at the given time. A
+	// second Schedule for one key adds a marker and replaces none.
+	Schedule(ctx context.Context, key string, due time.Time) error
+
+	// Due yields every marker due at or before now, earliest first.
+	Due(ctx context.Context, now time.Time) iter.Seq2[WakeupMarker, error]
+
+	// Forget drops the exact marker, and not every marker that names
+	// its invocation. A repeated Schedule can leave a second one.
+	Forget(ctx context.Context, m WakeupMarker) error
 }
 
 // HashInput returns the hash that Record.InputHash holds. Pass the

@@ -5,6 +5,12 @@
 // One bucket means one failure domain and one prefix to delete. The
 // interfaces stay separate, so another backend can implement any one of
 // them alone.
+//
+// Two kinds of key meet in this package. A key addresses one invocation,
+// such as "demo/Charge/id-1", and every exported method takes one. An
+// object key names one S3 object, and only this package builds or reads
+// one. The unexported ...Key and ...Prefix helpers turn the first into
+// the second, and they are the only place the two ever mix.
 package s3store
 
 import (
@@ -17,6 +23,7 @@ import (
 	"iter"
 	"path"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,7 +42,7 @@ import (
 // in the caller, and a read of it must not exhaust memory.
 const maxObjectSize = 8 << 20
 
-// api is the part of the S3 client that the journal uses. A test
+// api is the part of the S3 client that the store uses. A test
 // supplies its own implementation.
 type api interface {
 	GetObject(context.Context, *s3.GetObjectInput, ...func(*s3.Options)) (*s3.GetObjectOutput, error)
@@ -53,10 +60,10 @@ type Store struct {
 }
 
 var (
-	_ journal.Store           = (*Store)(nil)
-	_ lease.Locker            = (*Store)(nil)
-	_ invocation.Store        = (*Store)(nil)
-	_ invocation.PendingIndex = (*Store)(nil)
+	_ journal.Store       = (*Store)(nil)
+	_ lease.Locker        = (*Store)(nil)
+	_ invocation.Store    = (*Store)(nil)
+	_ invocation.DueIndex = (*Store)(nil)
 )
 
 // leaseRecord is the stored form of a lease. A released lease keeps its
@@ -94,38 +101,63 @@ func NewFromEnv(bucket string, rootPrefix string) (*Store, error) {
 	return New(s3.NewFromConfig(cfg), bucket, rootPrefix)
 }
 
-// invocationPrefix is the subtree of one invocation. The key holds the
-// service, the handler, and the id, which invocation.Validate checks.
-func (j *Store) invocationPrefix(key string) string {
-	return path.Join(j.rootPrefix, "invocations", key)
+// invocationPrefix returns the object prefix of one invocation. The key
+// holds the service, the handler, and the id, which Validate checks.
+func (s *Store) invocationPrefix(key string) string {
+	return path.Join(s.rootPrefix, "invocations", key)
 }
 
-func (j *Store) recordKey(key string) string {
-	return path.Join(j.invocationPrefix(key), "invocation.json")
+func (s *Store) recordKey(key string) string {
+	return path.Join(s.invocationPrefix(key), "invocation.json")
 }
 
-func (j *Store) leaseKey(key string) string {
-	return path.Join(j.invocationPrefix(key), "lease.json")
+func (s *Store) leaseKey(key string) string {
+	return path.Join(s.invocationPrefix(key), "lease.json")
 }
 
-func (j *Store) entriesPrefix(key string) string {
-	return path.Join(j.invocationPrefix(key), "entries") + "/"
+func (s *Store) entriesPrefix(key string) string {
+	return path.Join(s.invocationPrefix(key), "entries") + "/"
 }
 
-// pendingPrefix is the index a dispatcher scans. A marker is an empty
+// duePrefix is the index a dispatcher scans. A marker is an empty
 // object, so a scan reads only the listing.
-func (j *Store) pendingPrefix() string {
-	return path.Join(j.rootPrefix, "pending") + "/"
+func (s *Store) duePrefix() string {
+	return path.Join(s.rootPrefix, "due") + "/"
 }
 
-func (j *Store) pendingKey(key string) string {
-	return j.pendingPrefix() + key
+// dueDigits pads the due seconds, so that lexicographic order over the
+// listing is numeric order over the time.
+const dueDigits = 20
+
+// markerKey names a marker by its due time and then its invocation. A
+// due time before the epoch is not representable and is clamped to it.
+func (s *Store) markerKey(key string, due time.Time) string {
+	secs := due.Unix()
+	if secs < 0 {
+		secs = 0
+	}
+	return fmt.Sprintf("%s%0*d/%s", s.duePrefix(), dueDigits, secs, key)
+}
+
+// parseMarker is the inverse of markerKey. invocation.Validate rejects a
+// separator in every part, so the segments after the due parse back.
+func (s *Store) parseMarker(objectKey string) (invocation.WakeupMarker, error) {
+	rest := strings.TrimPrefix(objectKey, s.duePrefix())
+	due, key, ok := strings.Cut(rest, "/")
+	if !ok || key == "" {
+		return invocation.WakeupMarker{}, fmt.Errorf("s3store: malformed marker %q", objectKey)
+	}
+	secs, err := strconv.ParseInt(due, 10, 64)
+	if err != nil {
+		return invocation.WakeupMarker{}, fmt.Errorf("s3store: malformed marker %q: %w", objectKey, err)
+	}
+	return invocation.WakeupMarker{Key: key, Due: time.Unix(secs, 0).UTC()}, nil
 }
 
 // entryKey names an entry by its step. The step is zero-padded, so a
 // listing returns the entries in the order that Read must give them.
-func (j *Store) entryKey(invocationID string, step int) string {
-	return fmt.Sprintf("%s%020d.json", j.entriesPrefix(invocationID), step)
+func (s *Store) entryKey(key string, step int) string {
+	return fmt.Sprintf("%s%020d.json", s.entriesPrefix(key), step)
 }
 
 // entryRecord is the stored form of an entry. The epoch is kept for
@@ -135,9 +167,9 @@ type entryRecord struct {
 	Epoch lease.Epoch `json:"epoch"`
 }
 
-// Create writes the record once and adds the invocation to the pending
-// index. It returns invocation.ErrExists if the address is taken.
-func (j *Store) Create(ctx context.Context, r invocation.Record) error {
+// Create writes the record once and schedules it to run at once. It
+// returns invocation.ErrExists if the address is taken.
+func (s *Store) Create(ctx context.Context, r invocation.Record) error {
 	if err := r.Validate(); err != nil {
 		return err
 	}
@@ -148,9 +180,9 @@ func (j *Store) Create(ctx context.Context, r invocation.Record) error {
 	}
 
 	key := r.Key()
-	_, err = j.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:      aws.String(j.bucket),
-		Key:         aws.String(j.recordKey(key)),
+	_, err = s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(s.bucket),
+		Key:         aws.String(s.recordKey(key)),
 		Body:        bytes.NewReader(body),
 		ContentType: aws.String("application/json"),
 		// The address is written once. A retried registration finds the
@@ -165,61 +197,123 @@ func (j *Store) Create(ctx context.Context, r invocation.Record) error {
 	}
 
 	// The marker goes in after the record, so a scan never yields a key
-	// that Get cannot read. A crash between the two leaves an
-	// undispatched record, which is why Create is safe to repeat.
-	if _, err := j.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(j.bucket),
-		Key:    aws.String(j.pendingKey(key)),
-		Body:   bytes.NewReader(nil),
-	}); err != nil {
-		return fmt.Errorf("s3store: put pending marker: %w", err)
-	}
-	return nil
+	// that Get cannot read. A crash between the two hides the record
+	// from every scan, which is an accepted limit of this design.
+	return s.Schedule(ctx, key, r.CreatedAt)
 }
 
 // Get returns the record at key, and invocation.ErrNotFound if there is
 // none.
-func (j *Store) Get(ctx context.Context, key string) (invocation.Record, error) {
+func (s *Store) Get(ctx context.Context, key string) (invocation.Record, error) {
+	r, _, err := s.getRecord(ctx, key)
+	return r, err
+}
+
+// getRecord returns the record and its ETag, which Update needs for the
+// conditional write.
+func (s *Store) getRecord(ctx context.Context, key string) (invocation.Record, string, error) {
 	if key == "" {
-		return invocation.Record{}, fmt.Errorf("%w: empty key", invocation.ErrInvalid)
+		return invocation.Record{}, "", fmt.Errorf("%w: empty key", invocation.ErrInvalid)
 	}
 
-	body, _, err := j.getObject(ctx, j.recordKey(key))
+	body, etag, err := s.getObject(ctx, s.recordKey(key))
 	if err != nil {
 		if isNotFound(err) {
-			return invocation.Record{}, invocation.ErrNotFound
+			return invocation.Record{}, "", invocation.ErrNotFound
 		}
-		return invocation.Record{}, fmt.Errorf("s3store: get record: %w", err)
+		return invocation.Record{}, "", fmt.Errorf("s3store: get record: %w", err)
 	}
 
 	var r invocation.Record
 	if err := json.Unmarshal(body, &r); err != nil {
-		return invocation.Record{}, fmt.Errorf("s3store: unmarshal record %q: %w", key, err)
+		return invocation.Record{}, "", fmt.Errorf("s3store: unmarshal record %q: %w", key, err)
 	}
-	return r, nil
+	return r, etag, nil
 }
 
-// Pending yields the key of every invocation that is not dispatched.
-func (j *Store) Pending(ctx context.Context) iter.Seq2[string, error] {
-	return func(yield func(string, error) bool) {
-		prefix := j.pendingPrefix()
-		pages := s3.NewListObjectsV2Paginator(j.client, &s3.ListObjectsV2Input{
-			Bucket: aws.String(j.bucket),
-			Prefix: aws.String(prefix),
+// Update replaces the record. It returns lease.ErrLeaseLost when the
+// stored record carries a later epoch, because a stale holder wrote it.
+func (s *Store) Update(ctx context.Context, r invocation.Record) error {
+	if err := r.Validate(); err != nil {
+		return err
+	}
+
+	key := r.Key()
+	stored, etag, err := s.getRecord(ctx, key)
+	if err != nil {
+		return err
+	}
+	if stored.Epoch > r.Epoch {
+		return lease.ErrLeaseLost
+	}
+
+	body, err := json.Marshal(r)
+	if err != nil {
+		return fmt.Errorf("s3store: marshal record: %w", err)
+	}
+
+	_, err = s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(s.bucket),
+		Key:         aws.String(s.recordKey(key)),
+		Body:        bytes.NewReader(body),
+		ContentType: aws.String("application/json"),
+		// The epoch check and the write are separate, so the ETag closes
+		// the gap in which another holder wrote the record.
+		IfMatch: aws.String(etag),
+	})
+	if err != nil {
+		if isPreconditionFailed(err) {
+			return lease.ErrLeaseLost
+		}
+		return fmt.Errorf("s3store: put record: %w", err)
+	}
+	return nil
+}
+
+// Schedule writes a marker that falls due at the given time. The marker
+// body is empty, because a listing returns the keys and not the bodies.
+func (s *Store) Schedule(ctx context.Context, key string, due time.Time) error {
+	if key == "" {
+		return fmt.Errorf("%w: empty key", invocation.ErrInvalid)
+	}
+	if _, err := s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(s.markerKey(key, due)),
+		Body:   bytes.NewReader(nil),
+	}); err != nil {
+		return fmt.Errorf("s3store: put due marker: %w", err)
+	}
+	return nil
+}
+
+// Due yields every marker due at or before now, earliest first. The due
+// time leads the key, so the scan stops at the first future marker and
+// its cost follows the ready work and not the backlog.
+func (s *Store) Due(ctx context.Context, now time.Time) iter.Seq2[invocation.WakeupMarker, error] {
+	return func(yield func(invocation.WakeupMarker, error) bool) {
+		pages := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
+			Bucket: aws.String(s.bucket),
+			Prefix: aws.String(s.duePrefix()),
 		})
 
 		for pages.HasMorePages() {
 			page, err := pages.NextPage(ctx)
 			if err != nil {
-				yield("", fmt.Errorf("s3store: list pending: %w", err))
+				yield(invocation.WakeupMarker{}, fmt.Errorf("s3store: list due: %w", err))
 				return
 			}
 			for _, obj := range page.Contents {
-				key := strings.TrimPrefix(aws.ToString(obj.Key), prefix)
-				if key == "" {
+				m, err := s.parseMarker(aws.ToString(obj.Key))
+				if err != nil {
+					if !yield(invocation.WakeupMarker{}, err) {
+						return
+					}
 					continue
 				}
-				if !yield(key, nil) {
+				if m.Due.After(now) {
+					return
+				}
+				if !yield(m, nil) {
 					return
 				}
 			}
@@ -227,24 +321,24 @@ func (j *Store) Pending(ctx context.Context) iter.Seq2[string, error] {
 	}
 }
 
-// ClearPending drops key from the index. Clearing a key that is not in
-// the index is not an error.
-func (j *Store) ClearPending(ctx context.Context, key string) error {
-	if key == "" {
+// Forget drops the exact marker, and not every marker that names its
+// invocation. A repeated Schedule can leave a second one.
+func (s *Store) Forget(ctx context.Context, m invocation.WakeupMarker) error {
+	if m.Key == "" {
 		return fmt.Errorf("%w: empty key", invocation.ErrInvalid)
 	}
-	if _, err := j.client.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: aws.String(j.bucket),
-		Key:    aws.String(j.pendingKey(key)),
+	if _, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(s.markerKey(m.Key, m.Due)),
 	}); err != nil {
-		return fmt.Errorf("s3store: delete pending marker: %w", err)
+		return fmt.Errorf("s3store: delete due marker: %w", err)
 	}
 	return nil
 }
 
 // Claim takes the lease for ttl. It returns lease.ErrClaimHeld if
 // another owner holds a lease that is not expired.
-func (j *Store) Claim(ctx context.Context, resource, owner string, ttl time.Duration) (*lease.Lease, error) {
+func (s *Store) Claim(ctx context.Context, resource, owner string, ttl time.Duration) (*lease.Lease, error) {
 	if resource == "" || owner == "" {
 		return nil, errors.New("s3store: empty resource or owner")
 	}
@@ -252,8 +346,8 @@ func (j *Store) Claim(ctx context.Context, resource, owner string, ttl time.Dura
 		return nil, errors.New("s3store: ttl must be positive")
 	}
 
-	key := j.leaseKey(resource)
-	current, etag, err := j.getLease(ctx, key)
+	objectKey := s.leaseKey(resource)
+	current, etag, err := s.getLease(ctx, objectKey)
 	if err != nil {
 		return nil, err
 	}
@@ -266,7 +360,7 @@ func (j *Store) Claim(ctx context.Context, resource, owner string, ttl time.Dura
 		next.Epoch = current.Epoch + 1
 	}
 
-	if err := j.putLease(ctx, key, next, etag); err != nil {
+	if err := s.putLease(ctx, objectKey, next, etag); err != nil {
 		// A failed condition means that another claimant won the race.
 		if isPreconditionFailed(err) {
 			return nil, lease.ErrClaimHeld
@@ -279,7 +373,7 @@ func (j *Store) Claim(ctx context.Context, resource, owner string, ttl time.Dura
 
 // Renew extends the lease under the same epoch. It returns
 // lease.ErrLeaseLost if the stored lease is no longer this holder's.
-func (j *Store) Renew(ctx context.Context, l *lease.Lease, ttl time.Duration) error {
+func (s *Store) Renew(ctx context.Context, l *lease.Lease, ttl time.Duration) error {
 	if l == nil {
 		return errors.New("s3store: nil lease")
 	}
@@ -287,8 +381,8 @@ func (j *Store) Renew(ctx context.Context, l *lease.Lease, ttl time.Duration) er
 		return errors.New("s3store: ttl must be positive")
 	}
 
-	key := j.leaseKey(l.Resource)
-	current, etag, err := j.getLease(ctx, key)
+	objectKey := s.leaseKey(l.Resource)
+	current, etag, err := s.getLease(ctx, objectKey)
 	if err != nil {
 		return err
 	}
@@ -298,7 +392,7 @@ func (j *Store) Renew(ctx context.Context, l *lease.Lease, ttl time.Duration) er
 
 	renewed := *current
 	renewed.Expires = time.Now().Add(ttl)
-	if err := j.putLease(ctx, key, renewed, etag); err != nil {
+	if err := s.putLease(ctx, objectKey, renewed, etag); err != nil {
 		// A failed condition means another holder wrote the lease first.
 		if isPreconditionFailed(err) {
 			return lease.ErrLeaseLost
@@ -326,13 +420,13 @@ func holds(current *leaseRecord, l *lease.Lease) bool {
 
 // Release drops the lease. It is not an error to release a lease that
 // the holder already lost.
-func (j *Store) Release(ctx context.Context, l *lease.Lease) error {
+func (s *Store) Release(ctx context.Context, l *lease.Lease) error {
 	if l == nil {
 		return errors.New("s3store: nil lease")
 	}
 
-	key := j.leaseKey(l.Resource)
-	current, etag, err := j.getLease(ctx, key)
+	objectKey := s.leaseKey(l.Resource)
+	current, etag, err := s.getLease(ctx, objectKey)
 	if err != nil {
 		return err
 	}
@@ -345,7 +439,7 @@ func (j *Store) Release(ctx context.Context, l *lease.Lease) error {
 	released := *current
 	released.Released = true
 	released.Expires = time.Now()
-	if err := j.putLease(ctx, key, released, etag); err != nil {
+	if err := s.putLease(ctx, objectKey, released, etag); err != nil {
 		// A failed condition means another engine claimed the lease
 		// after the read, so this holder has nothing left to release.
 		if isPreconditionFailed(err) {
@@ -358,9 +452,9 @@ func (j *Store) Release(ctx context.Context, l *lease.Lease) error {
 
 // Append writes one entry. The conditional write on the entry key is
 // the fence, so Append needs no lease and never reads one.
-func (j *Store) Append(ctx context.Context, invocationID string, epoch lease.Epoch, e journal.Entry) error {
-	if invocationID == "" {
-		return errors.New("s3store: empty invocation id")
+func (s *Store) Append(ctx context.Context, key string, epoch lease.Epoch, e journal.Entry) error {
+	if key == "" {
+		return fmt.Errorf("%w: empty key", invocation.ErrInvalid)
 	}
 	if e.Step < 0 {
 		return fmt.Errorf("s3store: negative step %d", e.Step)
@@ -371,9 +465,9 @@ func (j *Store) Append(ctx context.Context, invocationID string, epoch lease.Epo
 		return fmt.Errorf("s3store: marshal entry: %w", err)
 	}
 
-	_, err = j.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:      aws.String(j.bucket),
-		Key:         aws.String(j.entryKey(invocationID, e.Step)),
+	_, err = s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(s.bucket),
+		Key:         aws.String(s.entryKey(key, e.Step)),
 		Body:        bytes.NewReader(body),
 		ContentType: aws.String("application/json"),
 		// The fence. This condition is atomic, so one writer wins the
@@ -382,7 +476,7 @@ func (j *Store) Append(ctx context.Context, invocationID string, epoch lease.Epo
 	})
 	if err != nil {
 		if isPreconditionFailed(err) {
-			return j.classifyConflict(ctx, invocationID, e)
+			return s.classifyConflict(ctx, key, e)
 		}
 		return fmt.Errorf("s3store: put entry: %w", err)
 	}
@@ -391,8 +485,8 @@ func (j *Store) Append(ctx context.Context, invocationID string, epoch lease.Epo
 
 // classifyConflict tells a repeat of a step from a different step that
 // took its place. Only the first is safe for the caller to adopt.
-func (j *Store) classifyConflict(ctx context.Context, invocationID string, e journal.Entry) error {
-	stored, err := j.getEntry(ctx, j.entryKey(invocationID, e.Step))
+func (s *Store) classifyConflict(ctx context.Context, key string, e journal.Entry) error {
+	stored, err := s.getEntry(ctx, s.entryKey(key, e.Step))
 	if err != nil {
 		return err
 	}
@@ -405,16 +499,16 @@ func (j *Store) classifyConflict(ctx context.Context, invocationID string, e jou
 
 // Read yields the entries of the invocation in step order. It needs no
 // lease, and yields nothing for an unknown invocation.
-func (j *Store) Read(ctx context.Context, invocationID string) iter.Seq2[journal.Entry, error] {
+func (s *Store) Read(ctx context.Context, key string) iter.Seq2[journal.Entry, error] {
 	return func(yield func(journal.Entry, error) bool) {
-		if invocationID == "" {
-			yield(journal.Entry{}, errors.New("s3store: empty invocation id"))
+		if key == "" {
+			yield(journal.Entry{}, fmt.Errorf("%w: empty key", invocation.ErrInvalid))
 			return
 		}
 
-		pages := s3.NewListObjectsV2Paginator(j.client, &s3.ListObjectsV2Input{
-			Bucket: aws.String(j.bucket),
-			Prefix: aws.String(j.entriesPrefix(invocationID)),
+		pages := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
+			Bucket: aws.String(s.bucket),
+			Prefix: aws.String(s.entriesPrefix(key)),
 		})
 
 		for pages.HasMorePages() {
@@ -424,7 +518,7 @@ func (j *Store) Read(ctx context.Context, invocationID string) iter.Seq2[journal
 				return
 			}
 			for _, obj := range page.Contents {
-				e, err := j.getEntry(ctx, aws.ToString(obj.Key))
+				e, err := s.getEntry(ctx, aws.ToString(obj.Key))
 				if !yield(e, err) || err != nil {
 					return
 				}
@@ -435,10 +529,10 @@ func (j *Store) Read(ctx context.Context, invocationID string) iter.Seq2[journal
 
 // getObject reads one object whole. It returns the raw error, so a
 // caller can tell a missing object from a failure.
-func (j *Store) getObject(ctx context.Context, key string) ([]byte, string, error) {
-	out, err := j.client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(j.bucket),
-		Key:    aws.String(key),
+func (s *Store) getObject(ctx context.Context, objectKey string) ([]byte, string, error) {
+	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(objectKey),
 	})
 	if err != nil {
 		return nil, "", err
@@ -447,31 +541,31 @@ func (j *Store) getObject(ctx context.Context, key string) ([]byte, string, erro
 
 	body, err := io.ReadAll(io.LimitReader(out.Body, maxObjectSize+1))
 	if err != nil {
-		return nil, "", fmt.Errorf("s3store: read %q: %w", key, err)
+		return nil, "", fmt.Errorf("s3store: read %q: %w", objectKey, err)
 	}
 	if len(body) > maxObjectSize {
-		return nil, "", fmt.Errorf("s3store: object %q is larger than %d bytes", key, maxObjectSize)
+		return nil, "", fmt.Errorf("s3store: object %q is larger than %d bytes", objectKey, maxObjectSize)
 	}
 	return body, aws.ToString(out.ETag), nil
 }
 
-func (j *Store) getEntry(ctx context.Context, key string) (journal.Entry, error) {
-	body, _, err := j.getObject(ctx, key)
+func (s *Store) getEntry(ctx context.Context, objectKey string) (journal.Entry, error) {
+	body, _, err := s.getObject(ctx, objectKey)
 	if err != nil {
-		return journal.Entry{}, fmt.Errorf("s3store: get entry %q: %w", key, err)
+		return journal.Entry{}, fmt.Errorf("s3store: get entry %q: %w", objectKey, err)
 	}
 
 	var rec entryRecord
 	if err := json.Unmarshal(body, &rec); err != nil {
-		return journal.Entry{}, fmt.Errorf("s3store: unmarshal entry %q: %w", key, err)
+		return journal.Entry{}, fmt.Errorf("s3store: unmarshal entry %q: %w", objectKey, err)
 	}
 	return rec.Entry, nil
 }
 
 // getLease returns the stored lease and its ETag. It returns a nil
 // record if no lease object exists yet.
-func (j *Store) getLease(ctx context.Context, key string) (*leaseRecord, string, error) {
-	body, etag, err := j.getObject(ctx, key)
+func (s *Store) getLease(ctx context.Context, objectKey string) (*leaseRecord, string, error) {
+	body, etag, err := s.getObject(ctx, objectKey)
 	if err != nil {
 		if isNotFound(err) {
 			return nil, "", nil
@@ -488,15 +582,15 @@ func (j *Store) getLease(ctx context.Context, key string) (*leaseRecord, string,
 
 // putLease writes the lease only if the stored object still has etag. An
 // empty etag requires that no object exists.
-func (j *Store) putLease(ctx context.Context, key string, rec leaseRecord, etag string) error {
+func (s *Store) putLease(ctx context.Context, objectKey string, rec leaseRecord, etag string) error {
 	body, err := json.Marshal(rec)
 	if err != nil {
 		return fmt.Errorf("s3store: marshal lease: %w", err)
 	}
 
 	in := &s3.PutObjectInput{
-		Bucket:      aws.String(j.bucket),
-		Key:         aws.String(key),
+		Bucket:      aws.String(s.bucket),
+		Key:         aws.String(objectKey),
 		Body:        bytes.NewReader(body),
 		ContentType: aws.String("application/json"),
 	}
@@ -506,7 +600,7 @@ func (j *Store) putLease(ctx context.Context, key string, rec leaseRecord, etag 
 		in.IfMatch = aws.String(etag)
 	}
 
-	if _, err := j.client.PutObject(ctx, in); err != nil {
+	if _, err := s.client.PutObject(ctx, in); err != nil {
 		return fmt.Errorf("s3store: put lease: %w", err)
 	}
 	return nil

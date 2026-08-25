@@ -181,3 +181,21 @@ func TestCompactMakesEqualInputsHashEqual(t *testing.T) {
 		t.Fatalf("%q and %q hash differently", a, b)
 	}
 }
+
+func TestTerminalStatus(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		status invocation.Status
+		want   bool
+	}{
+		{invocation.Pending, false},
+		{invocation.Running, false},
+		{invocation.Succeeded, true},
+		{invocation.Failed, true},
+	} {
+		if got := tc.status.Terminal(); got != tc.want {
+			t.Errorf("%q.Terminal() = %v, want %v", tc.status, got, tc.want)
+		}
+	}
+}

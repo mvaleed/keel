@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -57,7 +58,7 @@ func startMinio() (*s3.Client, error) {
 	}), nil
 }
 
-// newJournal returns a journal that has its own fresh bucket.
+// newStore returns a store that has its own fresh bucket.
 func newStore(t *testing.T) *s3store.Store {
 	t.Helper()
 	c, err := client()
@@ -65,11 +66,11 @@ func newStore(t *testing.T) *s3store.Store {
 		t.Fatalf("minio: %v", err)
 	}
 
-	j, err := s3store.New(c, newBucket(t, c), "keel")
+	store, err := s3store.New(c, newBucket(t, c), "keel")
 	if err != nil {
-		t.Fatalf("new journal: %v", err)
+		t.Fatalf("new store: %v", err)
 	}
-	return j
+	return store
 }
 
 // newBucket creates a bucket that only the calling test uses.
@@ -89,10 +90,10 @@ var bucketSeq atomic.Uint64
 
 func TestClaimAndAppendAndRead(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 	ctx := t.Context()
 
-	held, err := j.Claim(ctx, "svc/h/inv-1", "worker-a", time.Minute)
+	held, err := store.Claim(ctx, "svc/h/inv-1", "worker-a", time.Minute)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -105,12 +106,12 @@ func TestClaimAndAppendAndRead(t *testing.T) {
 		{Step: 1, Name: "ship", Err: "carrier down"},
 	}
 	for _, e := range want {
-		if err := j.Append(ctx, held.Resource, held.Epoch, e); err != nil {
+		if err := store.Append(ctx, held.Resource, held.Epoch, e); err != nil {
 			t.Fatalf("append: %v", err)
 		}
 	}
 
-	got, err := journal.Collect(j.Read(ctx, "svc/h/inv-1"))
+	got, err := journal.Collect(store.Read(ctx, "svc/h/inv-1"))
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -119,9 +120,9 @@ func TestClaimAndAppendAndRead(t *testing.T) {
 
 func TestReadEmptyInvocation(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 
-	got, err := journal.Collect(j.Read(t.Context(), "svc/h/missing"))
+	got, err := journal.Collect(store.Read(t.Context(), "svc/h/missing"))
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -132,27 +133,27 @@ func TestReadEmptyInvocation(t *testing.T) {
 
 func TestClaimHeldByOtherOwner(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 	ctx := t.Context()
 
-	if _, err := j.Claim(ctx, "svc/h/inv-2", "worker-a", time.Minute); err != nil {
+	if _, err := store.Claim(ctx, "svc/h/inv-2", "worker-a", time.Minute); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	if _, err := j.Claim(ctx, "svc/h/inv-2", "worker-b", time.Minute); !errors.Is(err, lease.ErrClaimHeld) {
+	if _, err := store.Claim(ctx, "svc/h/inv-2", "worker-b", time.Minute); !errors.Is(err, lease.ErrClaimHeld) {
 		t.Fatalf("second claim err = %v, want ErrClaimHeld", err)
 	}
 }
 
 func TestClaimBySameOwnerBumpsEpoch(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 	ctx := t.Context()
 
-	first, err := j.Claim(ctx, "svc/h/inv-3", "worker-a", time.Minute)
+	first, err := store.Claim(ctx, "svc/h/inv-3", "worker-a", time.Minute)
 	if err != nil {
 		t.Fatalf("first claim: %v", err)
 	}
-	second, err := j.Claim(ctx, "svc/h/inv-3", "worker-a", time.Minute)
+	second, err := store.Claim(ctx, "svc/h/inv-3", "worker-a", time.Minute)
 	if err != nil {
 		t.Fatalf("second claim: %v", err)
 	}
@@ -163,15 +164,15 @@ func TestClaimBySameOwnerBumpsEpoch(t *testing.T) {
 
 func TestClaimAfterExpiry(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 	ctx := t.Context()
 
-	if _, err := j.Claim(ctx, "svc/h/inv-4", "worker-a", 50*time.Millisecond); err != nil {
+	if _, err := store.Claim(ctx, "svc/h/inv-4", "worker-a", 50*time.Millisecond); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 	time.Sleep(100 * time.Millisecond)
 
-	held, err := j.Claim(ctx, "svc/h/inv-4", "worker-b", time.Minute)
+	held, err := store.Claim(ctx, "svc/h/inv-4", "worker-b", time.Minute)
 	if err != nil {
 		t.Fatalf("claim after expiry: %v", err)
 	}
@@ -182,22 +183,22 @@ func TestClaimAfterExpiry(t *testing.T) {
 
 func TestReleaseLetsAnotherOwnerClaim(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 	ctx := t.Context()
 
-	held, err := j.Claim(ctx, "svc/h/inv-5", "worker-a", time.Hour)
+	held, err := store.Claim(ctx, "svc/h/inv-5", "worker-a", time.Hour)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	if err := j.Release(ctx, held); err != nil {
+	if err := store.Release(ctx, held); err != nil {
 		t.Fatalf("release: %v", err)
 	}
 	// A second release of the same held must stay silent.
-	if err := j.Release(ctx, held); err != nil {
+	if err := store.Release(ctx, held); err != nil {
 		t.Fatalf("second release: %v", err)
 	}
 
-	next, err := j.Claim(ctx, "svc/h/inv-5", "worker-b", time.Minute)
+	next, err := store.Claim(ctx, "svc/h/inv-5", "worker-b", time.Minute)
 	if err != nil {
 		t.Fatalf("claim after release: %v", err)
 	}
@@ -208,10 +209,10 @@ func TestReleaseLetsAnotherOwnerClaim(t *testing.T) {
 
 func TestAppendDoesNotReadTheLease(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 	ctx := t.Context()
 
-	held, err := j.Claim(ctx, "svc/h/inv-6", "worker-a", 50*time.Millisecond)
+	held, err := store.Claim(ctx, "svc/h/inv-6", "worker-a", 50*time.Millisecond)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -220,11 +221,11 @@ func TestAppendDoesNotReadTheLease(t *testing.T) {
 	// The lease is expired, and the write still lands. The fence is the
 	// conditional write on the step, not the lease.
 	want := journal.Entry{Step: 0, Name: "late"}
-	if err := j.Append(ctx, held.Resource, held.Epoch, want); err != nil {
+	if err := store.Append(ctx, held.Resource, held.Epoch, want); err != nil {
 		t.Fatalf("append with an expired lease: %v", err)
 	}
 
-	got, err := journal.Collect(j.Read(ctx, "svc/h/inv-6"))
+	got, err := journal.Collect(store.Read(ctx, "svc/h/inv-6"))
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -233,33 +234,33 @@ func TestAppendDoesNotReadTheLease(t *testing.T) {
 
 func TestReadOrdersEntriesByEpoch(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 	ctx := t.Context()
 
-	first, err := j.Claim(ctx, "svc/h/inv-7", "worker-a", time.Minute)
+	first, err := store.Claim(ctx, "svc/h/inv-7", "worker-a", time.Minute)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 	// Append out of step order, so the test proves Read sorts by step.
 	for _, step := range []int{1, 0} {
-		if err := j.Append(ctx, first.Resource, first.Epoch, journal.Entry{Step: step, Name: "a"}); err != nil {
+		if err := store.Append(ctx, first.Resource, first.Epoch, journal.Entry{Step: step, Name: "a"}); err != nil {
 			t.Fatalf("append %d: %v", step, err)
 		}
 	}
 
-	if err := j.Release(ctx, first); err != nil {
+	if err := store.Release(ctx, first); err != nil {
 		t.Fatalf("release: %v", err)
 	}
 	// A takeover continues the same history at a later step.
-	second, err := j.Claim(ctx, "svc/h/inv-7", "worker-b", time.Minute)
+	second, err := store.Claim(ctx, "svc/h/inv-7", "worker-b", time.Minute)
 	if err != nil {
 		t.Fatalf("second claim: %v", err)
 	}
-	if err := j.Append(ctx, second.Resource, second.Epoch, journal.Entry{Step: 2, Name: "b"}); err != nil {
+	if err := store.Append(ctx, second.Resource, second.Epoch, journal.Entry{Step: 2, Name: "b"}); err != nil {
 		t.Fatalf("append 2: %v", err)
 	}
 
-	got, err := journal.Collect(j.Read(ctx, "svc/h/inv-7"))
+	got, err := journal.Collect(store.Read(ctx, "svc/h/inv-7"))
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -270,25 +271,25 @@ func TestReadOrdersEntriesByEpoch(t *testing.T) {
 
 func TestAppendSameStepTwiceIsRejected(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 	ctx := t.Context()
 
-	held, err := j.Claim(ctx, "svc/h/inv-13", "worker-a", time.Minute)
+	held, err := store.Claim(ctx, "svc/h/inv-13", "worker-a", time.Minute)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 	want := journal.Entry{Step: 0, Name: "charge", Output: json.RawMessage(`{"id":"first"}`)}
-	if err := j.Append(ctx, held.Resource, held.Epoch, want); err != nil {
+	if err := store.Append(ctx, held.Resource, held.Epoch, want); err != nil {
 		t.Fatalf("first append: %v", err)
 	}
 
 	second := journal.Entry{Step: 0, Name: "charge", Output: json.RawMessage(`{"id":"second"}`)}
-	if err := j.Append(ctx, held.Resource, held.Epoch, second); !errors.Is(err, journal.ErrStepExists) {
+	if err := store.Append(ctx, held.Resource, held.Epoch, second); !errors.Is(err, journal.ErrStepExists) {
 		t.Fatalf("second append err = %v, want ErrStepExists", err)
 	}
 
 	// The first writer's value must survive, so a replay stays stable.
-	got, err := journal.Collect(j.Read(ctx, "svc/h/inv-13"))
+	got, err := journal.Collect(store.Read(ctx, "svc/h/inv-13"))
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -297,37 +298,37 @@ func TestAppendSameStepTwiceIsRejected(t *testing.T) {
 
 func TestStaleHolderCannotForkHistory(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 	ctx := t.Context()
 
-	stale, err := j.Claim(ctx, "svc/h/inv-14", "worker-a", 50*time.Millisecond)
+	stale, err := store.Claim(ctx, "svc/h/inv-14", "worker-a", 50*time.Millisecond)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	if err := j.Append(ctx, stale.Resource, stale.Epoch, journal.Entry{Step: 0, Name: "done"}); err != nil {
+	if err := store.Append(ctx, stale.Resource, stale.Epoch, journal.Entry{Step: 0, Name: "done"}); err != nil {
 		t.Fatalf("append: %v", err)
 	}
 	time.Sleep(100 * time.Millisecond)
 
-	fresh, err := j.Claim(ctx, "svc/h/inv-14", "worker-b", time.Minute)
+	fresh, err := store.Claim(ctx, "svc/h/inv-14", "worker-b", time.Minute)
 	if err != nil {
 		t.Fatalf("takeover: %v", err)
 	}
-	if err := j.Append(ctx, fresh.Resource, fresh.Epoch, journal.Entry{Step: 1, Name: "next"}); err != nil {
+	if err := store.Append(ctx, fresh.Resource, fresh.Epoch, journal.Entry{Step: 1, Name: "next"}); err != nil {
 		t.Fatalf("append after takeover: %v", err)
 	}
 
 	// The step is taken, so the conditional write rejects the stale
 	// holder and the recorded entry does not change.
-	if err := j.Append(ctx, stale.Resource, stale.Epoch, journal.Entry{Step: 1, Name: "zombie"}); !errors.Is(err, journal.ErrNonDeterministic) {
+	if err := store.Append(ctx, stale.Resource, stale.Epoch, journal.Entry{Step: 1, Name: "zombie"}); !errors.Is(err, journal.ErrNonDeterministic) {
 		t.Fatalf("zombie append err = %v, want ErrNonDeterministic", err)
 	}
 	// A repeat of the step the new holder wrote is safe to adopt.
-	if err := j.Append(ctx, stale.Resource, stale.Epoch, journal.Entry{Step: 1, Name: "next"}); !errors.Is(err, journal.ErrStepExists) {
+	if err := store.Append(ctx, stale.Resource, stale.Epoch, journal.Entry{Step: 1, Name: "next"}); !errors.Is(err, journal.ErrStepExists) {
 		t.Fatalf("zombie repeat err = %v, want ErrStepExists", err)
 	}
 
-	got, err := journal.Collect(j.Read(ctx, "svc/h/inv-14"))
+	got, err := journal.Collect(store.Read(ctx, "svc/h/inv-14"))
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -341,29 +342,29 @@ func TestStaleHolderCannotForkHistory(t *testing.T) {
 // itself when it loses the lease.
 func TestStaleHolderWinsAnUnwrittenStep(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 	ctx := t.Context()
 
-	stale, err := j.Claim(ctx, "svc/h/inv-19", "worker-a", 50*time.Millisecond)
+	stale, err := store.Claim(ctx, "svc/h/inv-19", "worker-a", 50*time.Millisecond)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 	time.Sleep(100 * time.Millisecond)
 
-	fresh, err := j.Claim(ctx, "svc/h/inv-19", "worker-b", time.Minute)
+	fresh, err := store.Claim(ctx, "svc/h/inv-19", "worker-b", time.Minute)
 	if err != nil {
 		t.Fatalf("takeover: %v", err)
 	}
 
-	if err := j.Append(ctx, stale.Resource, stale.Epoch, journal.Entry{Step: 0, Name: "raced"}); err != nil {
+	if err := store.Append(ctx, stale.Resource, stale.Epoch, journal.Entry{Step: 0, Name: "raced"}); err != nil {
 		t.Fatalf("stale append: %v", err)
 	}
 	// The new holder now finds the step taken, and adopts it.
-	if err := j.Append(ctx, fresh.Resource, fresh.Epoch, journal.Entry{Step: 0, Name: "raced"}); !errors.Is(err, journal.ErrStepExists) {
+	if err := store.Append(ctx, fresh.Resource, fresh.Epoch, journal.Entry{Step: 0, Name: "raced"}); !errors.Is(err, journal.ErrStepExists) {
 		t.Fatalf("append err = %v, want ErrStepExists", err)
 	}
 
-	got, err := journal.Collect(j.Read(ctx, "svc/h/inv-19"))
+	got, err := journal.Collect(store.Read(ctx, "svc/h/inv-19"))
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -372,17 +373,17 @@ func TestStaleHolderWinsAnUnwrittenStep(t *testing.T) {
 
 func TestRenewKeepsEpochAndExtendsLease(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 	ctx := t.Context()
 
-	held, err := j.Claim(ctx, "svc/h/inv-15", "worker-a", 300*time.Millisecond)
+	held, err := store.Claim(ctx, "svc/h/inv-15", "worker-a", 300*time.Millisecond)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 	epoch, expires := held.Epoch, held.Expires()
 
 	time.Sleep(150 * time.Millisecond)
-	if err := j.Renew(ctx, held, time.Minute); err != nil {
+	if err := store.Renew(ctx, held, time.Minute); err != nil {
 		t.Fatalf("renew: %v", err)
 	}
 	if held.Epoch != epoch {
@@ -394,89 +395,65 @@ func TestRenewKeepsEpochAndExtendsLease(t *testing.T) {
 
 	// Past the original ttl the renewed held must still append.
 	time.Sleep(200 * time.Millisecond)
-	if err := j.Append(ctx, held.Resource, held.Epoch, journal.Entry{Step: 0, Name: "late"}); err != nil {
+	if err := store.Append(ctx, held.Resource, held.Epoch, journal.Entry{Step: 0, Name: "late"}); err != nil {
 		t.Fatalf("append after renew: %v", err)
 	}
 	// The renewal must not have let another owner in.
-	if _, err := j.Claim(ctx, "svc/h/inv-15", "worker-b", time.Minute); !errors.Is(err, lease.ErrClaimHeld) {
+	if _, err := store.Claim(ctx, "svc/h/inv-15", "worker-b", time.Minute); !errors.Is(err, lease.ErrClaimHeld) {
 		t.Fatalf("claim err = %v, want ErrClaimHeld", err)
 	}
 }
 
 func TestRenewAfterTakeoverFails(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 	ctx := t.Context()
 
-	held, err := j.Claim(ctx, "svc/h/inv-16", "worker-a", 50*time.Millisecond)
+	held, err := store.Claim(ctx, "svc/h/inv-16", "worker-a", 50*time.Millisecond)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 	time.Sleep(100 * time.Millisecond)
-	if _, err := j.Claim(ctx, "svc/h/inv-16", "worker-b", time.Minute); err != nil {
+	if _, err := store.Claim(ctx, "svc/h/inv-16", "worker-b", time.Minute); err != nil {
 		t.Fatalf("takeover: %v", err)
 	}
 
-	if err := j.Renew(ctx, held, time.Minute); !errors.Is(err, lease.ErrLeaseLost) {
+	if err := store.Renew(ctx, held, time.Minute); !errors.Is(err, lease.ErrLeaseLost) {
 		t.Fatalf("renew err = %v, want ErrLeaseLost", err)
 	}
 }
 
-func TestHeartbeatHoldsLeaseAcrossLongCall(t *testing.T) {
+func TestRepeatedRenewHoldsALongCall(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 	ctx := t.Context()
 
+	// A driver renews while its attempt makes progress, so the backend
+	// must hold one lease across a call that outlives the ttl.
 	const ttl = 300 * time.Millisecond
-	held, err := j.Claim(ctx, "svc/h/inv-17", "worker-a", ttl)
+	held, err := store.Claim(ctx, "svc/h/inv-17", "worker-a", ttl)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-
-	stop := lease.Keepalive(ctx, j, held, ttl)
-	// Stand in for a service call that outlives the ttl.
-	time.Sleep(3 * ttl)
-
-	if err := j.Append(ctx, held.Resource, held.Epoch, journal.Entry{Step: 0, Name: "slow"}); err != nil {
-		t.Fatalf("append under heartbeat: %v", err)
-	}
-	if err := stop(); err != nil {
-		t.Fatalf("heartbeat: %v", err)
-	}
-	// A second stop must repeat the same answer, not block.
-	if err := stop(); err != nil {
-		t.Fatalf("second stop: %v", err)
-	}
-}
-
-func TestHeartbeatReportsLostLease(t *testing.T) {
-	t.Parallel()
-	j := newStore(t)
-	ctx := t.Context()
-
-	const ttl = 300 * time.Millisecond
-	held, err := j.Claim(ctx, "svc/h/inv-18", "worker-a", ttl)
-	if err != nil {
-		t.Fatalf("claim: %v", err)
-	}
-	if err := j.Release(ctx, held); err != nil {
-		t.Fatalf("release: %v", err)
-	}
-	if _, err := j.Claim(ctx, "svc/h/inv-18", "worker-b", time.Minute); err != nil {
-		t.Fatalf("takeover: %v", err)
+	for range 3 {
+		time.Sleep(ttl / 3)
+		if err := store.Renew(ctx, held, ttl); err != nil {
+			t.Fatalf("renew: %v", err)
+		}
 	}
 
-	stop := lease.Keepalive(ctx, j, held, ttl)
-	// Wait past the first renewal, which must find the held gone.
-	time.Sleep(2 * ttl)
-	if err := stop(); !errors.Is(err, lease.ErrLeaseLost) {
-		t.Fatalf("heartbeat err = %v, want ErrLeaseLost", err)
+	if err := store.Append(ctx, held.Resource, held.Epoch, journal.Entry{Step: 0, Name: "slow"}); err != nil {
+		t.Fatalf("append under a renewed lease: %v", err)
+	}
+	// No renewal may let another owner in.
+	if _, err := store.Claim(ctx, "svc/h/inv-17", "worker-b", time.Minute); !errors.Is(err, lease.ErrClaimHeld) {
+		t.Fatalf("claim err = %v, want ErrClaimHeld", err)
 	}
 }
 
 func TestConcurrentClaimGivesOneWinner(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 	ctx := t.Context()
 
 	const claimants = 8
@@ -491,7 +468,7 @@ func TestConcurrentClaimGivesOneWinner(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			l, err := j.Claim(ctx, "svc/h/inv-8", fmt.Sprintf("worker-%d", i), time.Minute)
+			l, err := store.Claim(ctx, "svc/h/inv-8", fmt.Sprintf("worker-%d", i), time.Minute)
 			mu.Lock()
 			defer mu.Unlock()
 			switch {
@@ -519,10 +496,10 @@ func TestConcurrentClaimGivesOneWinner(t *testing.T) {
 
 func TestConcurrentAppendToOneStepHasOneWinner(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 	ctx := t.Context()
 
-	held, err := j.Claim(ctx, "svc/h/inv-19", "worker-a", time.Minute)
+	held, err := store.Claim(ctx, "svc/h/inv-19", "worker-a", time.Minute)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -540,7 +517,7 @@ func TestConcurrentAppendToOneStepHasOneWinner(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			// One step, one name: this tests the fence, not the name.
-			err := j.Append(ctx, held.Resource, held.Epoch, journal.Entry{
+			err := store.Append(ctx, held.Resource, held.Epoch, journal.Entry{
 				Step:   0,
 				Name:   "charge",
 				Output: json.RawMessage(fmt.Sprintf("%d", i)),
@@ -569,7 +546,7 @@ func TestConcurrentAppendToOneStepHasOneWinner(t *testing.T) {
 		t.Fatalf("got %d ErrStepExists, want %d", existed, writers-1)
 	}
 
-	got, err := journal.Collect(j.Read(ctx, "svc/h/inv-19"))
+	got, err := journal.Collect(store.Read(ctx, "svc/h/inv-19"))
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -580,10 +557,10 @@ func TestConcurrentAppendToOneStepHasOneWinner(t *testing.T) {
 
 func TestConcurrentAppendKeepsEveryEntry(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 	ctx := t.Context()
 
-	held, err := j.Claim(ctx, "svc/h/inv-9", "worker-a", time.Minute)
+	held, err := store.Claim(ctx, "svc/h/inv-9", "worker-a", time.Minute)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -595,7 +572,7 @@ func TestConcurrentAppendKeepsEveryEntry(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errs[i] = j.Append(ctx, held.Resource, held.Epoch, journal.Entry{Step: i, Name: fmt.Sprintf("step-%d", i)})
+			errs[i] = store.Append(ctx, held.Resource, held.Epoch, journal.Entry{Step: i, Name: fmt.Sprintf("step-%d", i)})
 		}()
 	}
 	wg.Wait()
@@ -605,7 +582,7 @@ func TestConcurrentAppendKeepsEveryEntry(t *testing.T) {
 		}
 	}
 
-	got, err := journal.Collect(j.Read(ctx, "svc/h/inv-9"))
+	got, err := journal.Collect(store.Read(ctx, "svc/h/inv-9"))
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -623,22 +600,22 @@ func TestConcurrentAppendKeepsEveryEntry(t *testing.T) {
 
 func TestReadPaginatesBeyondOnePage(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 	ctx := t.Context()
 
-	held, err := j.Claim(ctx, "svc/h/inv-10", "worker-a", 10*time.Minute)
+	held, err := store.Claim(ctx, "svc/h/inv-10", "worker-a", 10*time.Minute)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 	// MinIO returns at most 1000 keys in one page.
 	const entries = 1100
 	for i := range entries {
-		if err := j.Append(ctx, held.Resource, held.Epoch, journal.Entry{Step: i}); err != nil {
+		if err := store.Append(ctx, held.Resource, held.Epoch, journal.Entry{Step: i}); err != nil {
 			t.Fatalf("append %d: %v", i, err)
 		}
 	}
 
-	got, err := journal.Collect(j.Read(ctx, "svc/h/inv-10"))
+	got, err := journal.Collect(store.Read(ctx, "svc/h/inv-10"))
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -654,21 +631,21 @@ func TestReadPaginatesBeyondOnePage(t *testing.T) {
 
 func TestSeparateInvocationsDoNotMix(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 	ctx := t.Context()
 
 	for _, id := range []string{"svc/h/inv-11", "svc/h/inv-12"} {
-		held, err := j.Claim(ctx, id, "worker-a", time.Minute)
+		held, err := store.Claim(ctx, id, "worker-a", time.Minute)
 		if err != nil {
 			t.Fatalf("claim %s: %v", id, err)
 		}
-		if err := j.Append(ctx, held.Resource, held.Epoch, journal.Entry{Name: id}); err != nil {
+		if err := store.Append(ctx, held.Resource, held.Epoch, journal.Entry{Name: id}); err != nil {
 			t.Fatalf("append %s: %v", id, err)
 		}
 	}
 
 	for _, id := range []string{"svc/h/inv-11", "svc/h/inv-12"} {
-		got, err := journal.Collect(j.Read(ctx, id))
+		got, err := journal.Collect(store.Read(ctx, id))
 		if err != nil {
 			t.Fatalf("read %s: %v", id, err)
 		}
@@ -720,12 +697,12 @@ func TestReleaseLosesRaceToNewClaim(t *testing.T) {
 	racer := &raceClient{Client: base}
 	slow, err := s3store.New(racer, bucket, "keel")
 	if err != nil {
-		t.Fatalf("new journal: %v", err)
+		t.Fatalf("new store: %v", err)
 	}
 	// The rival uses a plain client, so only the release is hooked.
 	rival, err := s3store.New(base, bucket, "keel")
 	if err != nil {
-		t.Fatalf("new rival journal: %v", err)
+		t.Fatalf("new rival store: %v", err)
 	}
 
 	held, err := slow.Claim(ctx, "svc/h/inv-20", "worker-a", 50*time.Millisecond)
@@ -756,22 +733,22 @@ func TestReleaseLosesRaceToNewClaim(t *testing.T) {
 
 func TestAppendDifferentNameAtSameStepIsNonDeterministic(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 	ctx := t.Context()
 
-	held, err := j.Claim(ctx, "svc/h/inv-21", "worker-a", time.Minute)
+	held, err := store.Claim(ctx, "svc/h/inv-21", "worker-a", time.Minute)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 	recorded := journal.Entry{Step: 1, Name: "charge", Output: json.RawMessage(`{"id":"pay_1"}`)}
-	if err := j.Append(ctx, held.Resource, held.Epoch, recorded); err != nil {
+	if err := store.Append(ctx, held.Resource, held.Epoch, recorded); err != nil {
 		t.Fatalf("append: %v", err)
 	}
 
 	// A handler that gained a step shifts "charge" to another position,
 	// so step 1 now replays as a different step.
 	shifted := journal.Entry{Step: 1, Name: "send_receipt"}
-	err = j.Append(ctx, held.Resource, held.Epoch, shifted)
+	err = store.Append(ctx, held.Resource, held.Epoch, shifted)
 	if !errors.Is(err, journal.ErrNonDeterministic) {
 		t.Fatalf("append err = %v, want ErrNonDeterministic", err)
 	}
@@ -785,7 +762,7 @@ func TestAppendDifferentNameAtSameStepIsNonDeterministic(t *testing.T) {
 	}
 
 	// The recorded step must survive the rejected write.
-	got, err := journal.Collect(j.Read(ctx, "svc/h/inv-21"))
+	got, err := journal.Collect(store.Read(ctx, "svc/h/inv-21"))
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -794,19 +771,19 @@ func TestAppendDifferentNameAtSameStepIsNonDeterministic(t *testing.T) {
 
 func TestAppendSameNameAtSameStepIsAdoptable(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 	ctx := t.Context()
 
-	held, err := j.Claim(ctx, "svc/h/inv-22", "worker-a", time.Minute)
+	held, err := store.Claim(ctx, "svc/h/inv-22", "worker-a", time.Minute)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	if err := j.Append(ctx, held.Resource, held.Epoch, journal.Entry{Step: 0, Name: "charge"}); err != nil {
+	if err := store.Append(ctx, held.Resource, held.Epoch, journal.Entry{Step: 0, Name: "charge"}); err != nil {
 		t.Fatalf("append: %v", err)
 	}
 
 	// A retry of the same step is benign, so it stays ErrStepExists.
-	err = j.Append(ctx, held.Resource, held.Epoch, journal.Entry{Step: 0, Name: "charge", Output: json.RawMessage(`2`)})
+	err = store.Append(ctx, held.Resource, held.Epoch, journal.Entry{Step: 0, Name: "charge", Output: json.RawMessage(`2`)})
 	if !errors.Is(err, journal.ErrStepExists) {
 		t.Fatalf("append err = %v, want ErrStepExists", err)
 	}
@@ -829,15 +806,15 @@ func record(id string, input string) invocation.Record {
 
 func TestCreateAndGet(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 	ctx := t.Context()
 
 	want := record("order-1", `{"amount":5}`)
-	if err := j.Create(ctx, want); err != nil {
+	if err := store.Create(ctx, want); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 
-	got, err := j.Get(ctx, want.Key())
+	got, err := store.Get(ctx, want.Key())
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -860,22 +837,22 @@ func TestCreateAndGet(t *testing.T) {
 
 func TestCreateIsWriteOnce(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 	ctx := t.Context()
 
 	first := record("order-2", `{"amount":5}`)
-	if err := j.Create(ctx, first); err != nil {
+	if err := store.Create(ctx, first); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 
 	// A second registration of one address must not start a second run,
 	// whatever it carries.
 	second := record("order-2", `{"amount":9999}`)
-	if err := j.Create(ctx, second); !errors.Is(err, invocation.ErrExists) {
+	if err := store.Create(ctx, second); !errors.Is(err, invocation.ErrExists) {
 		t.Fatalf("second create err = %v, want ErrExists", err)
 	}
 
-	got, err := j.Get(ctx, first.Key())
+	got, err := store.Get(ctx, first.Key())
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -886,74 +863,81 @@ func TestCreateIsWriteOnce(t *testing.T) {
 
 func TestGetUnknownRecord(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 
-	if _, err := j.Get(t.Context(), "billing/Charge/never"); !errors.Is(err, invocation.ErrNotFound) {
+	if _, err := store.Get(t.Context(), "billing/Charge/never"); !errors.Is(err, invocation.ErrNotFound) {
 		t.Fatalf("get err = %v, want ErrNotFound", err)
 	}
 }
 
 func TestCreateRejectsAnInvalidKey(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 
 	bad := record("../../escape", `{}`)
-	if err := j.Create(t.Context(), bad); !errors.Is(err, invocation.ErrInvalid) {
+	if err := store.Create(t.Context(), bad); !errors.Is(err, invocation.ErrInvalid) {
 		t.Fatalf("create err = %v, want ErrInvalid", err)
 	}
 }
 
-func TestPendingListsEveryNewRecord(t *testing.T) {
+// due collects the markers a scan yields at now.
+func due(t *testing.T, store *s3store.Store, now time.Time) []invocation.WakeupMarker {
+	t.Helper()
+	var got []invocation.WakeupMarker
+	for m, err := range store.Due(t.Context(), now) {
+		if err != nil {
+			t.Fatalf("due: %v", err)
+		}
+		got = append(got, m)
+	}
+	return got
+}
+
+func TestCreateSchedulesEveryNewRecord(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 	ctx := t.Context()
 
 	want := map[string]bool{}
 	for _, id := range []string{"order-10", "order-11", "order-12"} {
 		r := record(id, `{}`)
-		if err := j.Create(ctx, r); err != nil {
+		if err := store.Create(ctx, r); err != nil {
 			t.Fatalf("create %s: %v", id, err)
 		}
 		want[r.Key()] = true
 	}
 
 	got := map[string]bool{}
-	for key, err := range j.Pending(ctx) {
-		if err != nil {
-			t.Fatalf("pending: %v", err)
-		}
-		got[key] = true
+	for _, m := range due(t, store, time.Now().Add(time.Minute)) {
+		got[m.Key] = true
 	}
 
 	if len(got) != len(want) {
-		t.Fatalf("pending = %v, want %v", got, want)
+		t.Fatalf("due = %v, want %v", got, want)
 	}
 	for key := range want {
 		if !got[key] {
-			t.Fatalf("pending %v is missing %q", got, key)
+			t.Fatalf("due %v is missing %q", got, key)
 		}
 	}
 }
 
-func TestPendingKeysAreReadable(t *testing.T) {
+func TestDueKeysAreReadable(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 	ctx := t.Context()
 
 	want := record("order-13", `{"a":1}`)
-	if err := j.Create(ctx, want); err != nil {
+	if err := store.Create(ctx, want); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 
-	// A dispatcher reads the record for every key a scan gives it, so a
-	// yielded key must always address one.
-	for key, err := range j.Pending(ctx) {
+	// A dispatcher reads the record for every marker a scan gives it, so
+	// a yielded marker must always address one.
+	for _, m := range due(t, store, time.Now().Add(time.Minute)) {
+		got, err := store.Get(ctx, m.Key)
 		if err != nil {
-			t.Fatalf("pending: %v", err)
-		}
-		got, err := j.Get(ctx, key)
-		if err != nil {
-			t.Fatalf("get %q: %v", key, err)
+			t.Fatalf("get %q: %v", m.Key, err)
 		}
 		if got.ID != want.ID {
 			t.Fatalf("record = %+v, want %s", got.Invocation, want.ID)
@@ -961,66 +945,216 @@ func TestPendingKeysAreReadable(t *testing.T) {
 	}
 }
 
-func TestClearPending(t *testing.T) {
+func TestUnschedule(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 	ctx := t.Context()
 
 	r := record("order-14", `{}`)
-	if err := j.Create(ctx, r); err != nil {
+	if err := store.Create(ctx, r); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if err := j.ClearPending(ctx, r.Key()); err != nil {
-		t.Fatalf("clear: %v", err)
+	m := invocation.WakeupMarker{Key: r.Key(), Due: r.CreatedAt}
+	if err := store.Forget(ctx, m); err != nil {
+		t.Fatalf("unschedule: %v", err)
 	}
 
-	for key, err := range j.Pending(ctx) {
-		if err != nil {
-			t.Fatalf("pending: %v", err)
-		}
-		t.Fatalf("pending still holds %q", key)
+	if got := due(t, store, time.Now().Add(time.Minute)); len(got) != 0 {
+		t.Fatalf("due still holds %v", got)
 	}
-	// Clearing the index must not touch the record itself.
-	if _, err := j.Get(ctx, r.Key()); err != nil {
-		t.Fatalf("get after clear: %v", err)
+	// Dropping a marker must not touch the record itself.
+	if _, err := store.Get(ctx, r.Key()); err != nil {
+		t.Fatalf("get after unschedule: %v", err)
 	}
-	// A repeat clear is silent, so a dispatcher can retry it.
-	if err := j.ClearPending(ctx, r.Key()); err != nil {
-		t.Fatalf("second clear: %v", err)
+	// A repeat is silent, so a dispatcher can retry it.
+	if err := store.Forget(ctx, m); err != nil {
+		t.Fatalf("second unschedule: %v", err)
 	}
 }
 
-func TestPendingIsEmptyForANewBucket(t *testing.T) {
+func TestDueIsEmptyForANewBucket(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 
-	for key, err := range j.Pending(t.Context()) {
-		if err != nil {
-			t.Fatalf("pending: %v", err)
+	if got := due(t, store, time.Now()); len(got) != 0 {
+		t.Fatalf("due holds %v, want nothing", got)
+	}
+}
+
+func TestDueReturnsTheEarliestMarkerFirst(t *testing.T) {
+	t.Parallel()
+	store := newStore(t)
+	ctx := t.Context()
+
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	for i, id := range []string{"late", "early", "middle"} {
+		offset := map[string]time.Duration{"early": 0, "middle": time.Minute, "late": 2 * time.Minute}[id]
+		_ = i
+		if err := store.Schedule(ctx, "billing/Charge/"+id, base.Add(offset)); err != nil {
+			t.Fatalf("schedule %s: %v", id, err)
 		}
-		t.Fatalf("pending holds %q, want nothing", key)
+	}
+
+	var got []string
+	for _, m := range due(t, store, time.Now()) {
+		got = append(got, m.Key)
+	}
+	want := []string{"billing/Charge/early", "billing/Charge/middle", "billing/Charge/late"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("due = %v, want %v", got, want)
+	}
+}
+
+func TestDueStopsAtNow(t *testing.T) {
+	t.Parallel()
+	store := newStore(t)
+	ctx := t.Context()
+
+	now := time.Now().Truncate(time.Second)
+	if err := store.Schedule(ctx, "billing/Charge/ready", now.Add(-time.Second)); err != nil {
+		t.Fatalf("schedule ready: %v", err)
+	}
+	if err := store.Schedule(ctx, "billing/Charge/later", now.Add(time.Hour)); err != nil {
+		t.Fatalf("schedule later: %v", err)
+	}
+
+	got := due(t, store, now)
+	if len(got) != 1 || got[0].Key != "billing/Charge/ready" {
+		t.Fatalf("due = %v, want only the ready marker", got)
+	}
+}
+
+func TestDueRoundTripsTheMarker(t *testing.T) {
+	t.Parallel()
+	store := newStore(t)
+	ctx := t.Context()
+
+	// A due time is named by whole seconds, so the marker returns the
+	// truncated time and Forget addresses the same object.
+	want := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := store.Schedule(ctx, "billing/Charge/rt", want); err != nil {
+		t.Fatalf("schedule: %v", err)
+	}
+
+	got := due(t, store, time.Now())
+	if len(got) != 1 {
+		t.Fatalf("due = %v, want one marker", got)
+	}
+	if !got[0].Due.Equal(want) {
+		t.Fatalf("due = %v, want %v", got[0].Due, want)
+	}
+	if err := store.Forget(ctx, got[0]); err != nil {
+		t.Fatalf("unschedule: %v", err)
+	}
+	if rest := due(t, store, time.Now()); len(rest) != 0 {
+		t.Fatalf("due still holds %v", rest)
+	}
+}
+
+func TestUnscheduleLeavesADuplicateMarker(t *testing.T) {
+	t.Parallel()
+	store := newStore(t)
+	ctx := t.Context()
+
+	// A crash between Schedule and Forget leaves two markers for one
+	// invocation. Dropping one must not drop the other.
+	key := "billing/Charge/dup"
+	first := time.Now().Add(-time.Hour).Truncate(time.Second)
+	second := first.Add(time.Minute)
+	for _, at := range []time.Time{first, second} {
+		if err := store.Schedule(ctx, key, at); err != nil {
+			t.Fatalf("schedule: %v", err)
+		}
+	}
+
+	if err := store.Forget(ctx, invocation.WakeupMarker{Key: key, Due: first}); err != nil {
+		t.Fatalf("unschedule: %v", err)
+	}
+	got := due(t, store, time.Now())
+	if len(got) != 1 || !got[0].Due.Equal(second) {
+		t.Fatalf("due = %v, want only the second marker", got)
+	}
+}
+
+func TestUpdateReplacesTheRecord(t *testing.T) {
+	t.Parallel()
+	store := newStore(t)
+	ctx := t.Context()
+
+	r := record("order-15", `{}`)
+	if err := store.Create(ctx, r); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	r.Status = invocation.Succeeded
+	r.Epoch = 3
+	r.Output = json.RawMessage(`{"ok":true}`)
+	if err := store.Update(ctx, r); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	got, err := store.Get(ctx, r.Key())
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status != invocation.Succeeded || got.Epoch != 3 {
+		t.Fatalf("record = %+v, want succeeded at epoch 3", got)
+	}
+}
+
+func TestUpdateRejectsAStaleEpoch(t *testing.T) {
+	t.Parallel()
+	store := newStore(t)
+	ctx := t.Context()
+
+	r := record("order-16", `{}`)
+	if err := store.Create(ctx, r); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	live := r
+	live.Epoch = 5
+	live.Status = invocation.Running
+	if err := store.Update(ctx, live); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	stale := r
+	stale.Epoch = 4
+	stale.Status = invocation.Failed
+	if err := store.Update(ctx, stale); !errors.Is(err, lease.ErrLeaseLost) {
+		t.Fatalf("update err = %v, want ErrLeaseLost", err)
+	}
+}
+
+func TestUpdateNeedsARecord(t *testing.T) {
+	t.Parallel()
+	store := newStore(t)
+
+	if err := store.Update(t.Context(), record("order-17", `{}`)); !errors.Is(err, invocation.ErrNotFound) {
+		t.Fatalf("update err = %v, want ErrNotFound", err)
 	}
 }
 
 func TestRecordAndJournalShareOneSubtree(t *testing.T) {
 	t.Parallel()
-	j := newStore(t)
+	store := newStore(t)
 	ctx := t.Context()
 
 	r := record("order-15", `{}`)
-	if err := j.Create(ctx, r); err != nil {
+	if err := store.Create(ctx, r); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	held, err := j.Claim(ctx, r.Key(), "worker-a", time.Minute)
+	held, err := store.Claim(ctx, r.Key(), "worker-a", time.Minute)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	if err := j.Append(ctx, r.Key(), held.Epoch, journal.Entry{Step: 0, Name: "charge"}); err != nil {
+	if err := store.Append(ctx, r.Key(), held.Epoch, journal.Entry{Step: 0, Name: "charge"}); err != nil {
 		t.Fatalf("append: %v", err)
 	}
 
 	// One address reaches the record, the lease, and the journal.
-	entries, err := journal.Collect(j.Read(ctx, r.Key()))
+	entries, err := journal.Collect(store.Read(ctx, r.Key()))
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
