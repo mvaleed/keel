@@ -5,7 +5,7 @@ is not the states themselves, but **what the durable parts look like in
 each one**. This page shows both together.
 
 The four durable parts are the record, the wakeup marker, the lease, and
-the journal. The README section `What Keel stores` describes each one.
+the journal. [What Keel stores](storage.md) describes each one.
 
 ```mermaid
 stateDiagram-v2
