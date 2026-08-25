@@ -72,17 +72,20 @@ type Entry struct {
 
 // Store is the durable backing for journals. Each entry is immutable and
 // named by its step. Implementations must be concurrency-safe.
+//
+// A key addresses one invocation, and it is not an invocation id. The
+// caller builds it, so this package never parses one.
 type Store interface {
 	// Append durably records e at step e.Step, and returns ErrStepExists
 	// if the same step and name is recorded, ErrNonDeterministic if the
 	// step holds another name, and lease.ErrLeaseLost if epoch is known
 	// to be stale. The first two are authoritative; the last is a hint.
-	Append(ctx context.Context, invocationID string, epoch lease.Epoch, e Entry) error
+	Append(ctx context.Context, key string, epoch lease.Epoch, e Entry) error
 
-	// Read yields the invocation's entries in step order, and nothing
-	// for an unknown invocation. It needs no lease. The sequence stops
-	// at the first error it yields.
-	Read(ctx context.Context, invocationID string) iter.Seq2[Entry, error]
+	// Read yields the invocation's entries in step order, and nothing for
+	// an unknown invocation. It reads one object per entry, so a replay
+	// costs one round trip per step.
+	Read(ctx context.Context, key string) iter.Seq2[Entry, error]
 }
 
 // Collect drains a Read sequence into a slice. It returns the first
