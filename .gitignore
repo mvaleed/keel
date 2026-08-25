@@ -27,9 +27,6 @@ go.work.sum
 # env file
 .env
 
-# durable journal files written by running the engine locally
-/data/
-
 # Editor/IDE
 # .idea/
 # .vscode/

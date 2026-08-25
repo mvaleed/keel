@@ -1,7 +1,10 @@
 # keel
 
-Durable execution for Go. A workflow survives a crash, a restart, and a
-deploy, because every step is journaled before it counts.
+Durable execution for Go. A workflow survives a crash, a restart, a
+deploy, and a bad network, because every step is journaled before it
+counts.
+
+**One static binary. One bucket. No database.**
 
 ```
    client ──POST──► keeld ──POST──► your worker
@@ -18,6 +21,29 @@ writing a workflow pleasant lives in a separate repository.
 > Early work. The API and the on-disk layout still change, and one engine
 > runs at a time. Read [the limits](docs/operating.md#limits-today)
 > before you rely on it.
+
+## One binary, one bucket
+
+Durable execution usually arrives with an operations bill: a database to
+run, a broker to keep alive, a cluster to keep in quorum. Keel asks for
+none of it.
+
+- **One static binary.** `keeld` builds with no CGO and links
+  statically. Copy it to a host, or put it in a `FROM scratch` image.
+- **One dependency at runtime.** S3-compatible object storage, and
+  nothing else. No Postgres, no Redis, no broker, no consensus cluster.
+- **Nothing on local disk.** The process writes no files, so the
+  container needs no volume and ephemeral storage is fine.
+- **Nothing to lose on restart.** Records, leases, and journals all live
+  in the bucket. The only thing the process keeps is the worker
+  registry, and each worker heartbeat rebuilds it within 10 seconds.
+- **Kill it whenever you like.** A stopped engine returns its work the
+  instant its lease expires, so a deploy is just a restart.
+
+The storage sits behind interfaces that name the rule they need, which is
+an atomic conditional write, and not the vendor that provides it. S3 is
+the one backend today, and `keeld` reads the default AWS configuration,
+so a store that needs its own endpoint needs a code change.
 
 ## Quick start
 
@@ -56,8 +82,6 @@ runs. See [the HTTP API](docs/http-api.md) for what a worker must serve.
   same invocation, whoever asks and however often.
 - **Work is never lost while nothing runs it.** A dead engine returns its
   invocations the instant its lease becomes claimable.
-- **The store is one seam.** S3 today, behind interfaces that name the
-  rule and not the vendor.
 
 ## Vision
 
