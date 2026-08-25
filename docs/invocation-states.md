@@ -1,8 +1,8 @@
 # The states of one invocation
 
-An invocation moves through four states. What makes Keel hard to follow
-is not the states themselves, but **what the durable parts look like in
-each one**. This page shows both together.
+An invocation moves through four states. The states are the easy part.
+The hard part is what the four durable parts look like in each one, so
+this page shows both together.
 
 The four durable parts are the record, the wakeup marker, the lease, and
 the journal. [What Keel stores](storage.md) describes each one.
@@ -77,7 +77,7 @@ The `Running` self-arrow leaves the record at `running`, and this is on
 purpose. An invocation never goes back to `pending`, because it has been
 attempted.
 
-The retry splits on one question only: **did the attempt make progress?**
+The retry splits on one question only. Did the attempt make progress?
 
 ```mermaid
 flowchart TB
@@ -117,7 +117,7 @@ flowchart TB
 | between `F1` and `F2` | a terminal record with a marker | the next scan reads the record and deletes the marker. |
 | after the journal append, before the record write | a fenced journal | the invocation runs once more and replays to the same answer. |
 
-Each pair is written in that order for one reason: **the other order loses
-work permanently.** A marker deleted before the record is terminal leaves
+Each pair is written in that order for one reason. The other order loses
+work permanently. A marker deleted before the record is terminal leaves
 an invocation that says `running` and that no scan will ever find again.
 S3 has no transaction across two objects, so the order is the only tool.

@@ -111,7 +111,7 @@ may change.
 
 ## Documentation
 
-[The design, the diagrams, and the flags](docs/) — or jump to
+[The design, the diagrams, and the flags](docs/). Or jump straight to
 [what Keel stores](docs/storage.md), which everything else assumes.
 
 ## License

@@ -14,7 +14,7 @@ Three numbers drive everything here, and all three are defaults:
 
 ## The healthy case
 
-The renewer holds the lease **on evidence**. Every journal entry the
+The renewer holds the lease on evidence. Every journal entry the
 worker produces calls `Progress`, and that is what earns the next 2
 minutes. A timer alone would prove nothing.
 
@@ -51,9 +51,9 @@ sequenceDiagram
     D->>S: release the lease
 ```
 
-The order at the end is fixed: **terminal record first, marker second,
-lease last.** Deleting the marker before the record is terminal would
-lose the invocation for good.
+The order at the end is fixed. Terminal record first, marker second,
+lease last. Deleting the marker before the record is terminal would lose
+the invocation for good.
 
 ## When the worker stops answering
 
@@ -87,8 +87,8 @@ sequenceDiagram
 ```
 
 This is the reason the renewer reads evidence and not a clock. A
-timer-based keepalive would renew this lease forever, and **no other
-engine could ever rescue the invocation**.
+timer-based keepalive would renew this lease forever, and no other
+engine could ever rescue the invocation.
 
 ## When the engine itself dies
 
