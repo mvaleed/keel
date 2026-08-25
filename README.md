@@ -59,6 +59,32 @@ runs. See [the HTTP API](docs/http-api.md) for what a worker must serve.
 - **The store is one seam.** S3 today, behind interfaces that name the
   rule and not the vendor.
 
+## Vision
+
+Keel aims to make a durable workflow as ordinary to write as a function.
+You write plain Go, you mark the steps that must not repeat, and the
+engine keeps the rest: the history, the retries, and the recovery.
+
+The engine works today. The parts that make it pleasant do not exist yet.
+
+**It does this now.** A client submits an invocation and the engine
+records it before it answers. A dispatcher finds the work, leases it, and
+calls a worker. Each step is journaled once, so a resumed invocation
+replays instead of repeating. A dead engine gives its work back.
+
+**Next.** A worker connection that streams each journal entry as it
+happens, which removes the limit on how long one handler may run. A
+durable sleep, so a workflow can wait for days without holding anything.
+A signal, so a workflow can wait for the outside world. The SDK that
+hides this protocol.
+
+**Later.** More than one engine. A journal that compacts, so a replay
+does not cost one read for each step. A worker that keeps the invocations
+it already replayed.
+
+This is a plan and not a promise. Nothing above is dated, and the order
+may change.
+
 ## Documentation
 
 [The design, the diagrams, and the flags](docs/) — or jump to
