@@ -97,11 +97,8 @@ shutdown may repeat the call.
 ## What a worker must serve
 
 The engine opens one WebSocket connection per attempt, at the address
-the worker announced:
-
-```
-GET <address>/keel/v1/invoke
-```
+the worker announced. The engine offers the subprotocol `keel.v1` in
+the handshake, and a worker must accept it or refuse the connection.
 
 The engine and the worker then trade JSON frames. The engine opens with
 a `start` frame, which carries the invocation id, the handler, the
@@ -119,4 +116,6 @@ ends the invocation as `failed`. The engine may send a `cancel` frame
 when the invocation is cancelled or the lease is lost, and the worker
 must stop.
 
-An SDK writes this protocol for you. It lives in a separate repository.
+An SDK writes this protocol for you. It lives in a separate
+repository. [The worker protocol](worker-protocol.md) is the full
+contract, and it is what an SDK implements.

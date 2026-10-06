@@ -16,6 +16,10 @@ import (
 
 const workerWebSocketEndpoint = "/keel/v1/invoke"
 
+// protocolV1 is the subprotocol the engine offers in the handshake, and
+// the worker must accept. See docs/worker-protocol.md.
+const protocolV1 = "keel.v1"
+
 const (
 	frameStart     = "start"
 	frameEntry     = "entry"
@@ -31,7 +35,10 @@ type streamFrame struct {
 	InvocationID string          `json:"invocation_id,omitempty"`
 	Handler      string          `json:"handler,omitempty"`
 	Input        json.RawMessage `json:"input,omitempty"`
-	Journal      []journal.Entry `json:"journal,omitempty"`
+	// Journal is the whole history, and only the start frame carries
+	// it. Execute always sets the pointer, so an empty history is an
+	// empty array and never an absent field.
+	Journal      *[]journal.Entry `json:"journal,omitempty"`
 	Entry        *journal.Entry  `json:"entry,omitempty"`
 	Step         *int            `json:"step,omitempty"`
 	Output       json.RawMessage `json:"output,omitempty"`
@@ -61,18 +68,29 @@ func (e wsExecutor) Execute(ctx context.Context, a Attempt) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	conn, _, err := websocket.Dial(ctx, address, nil)
+	conn, _, err := websocket.Dial(ctx, address, &websocket.DialOptions{
+		Subprotocols: []string{protocolV1},
+	})
 	if err != nil {
 		return Result{}, fmt.Errorf("connecting to worker %q: %w", address, err)
 	}
 	defer conn.CloseNow()
+	// A worker that accepts the connection without the subprotocol does
+	// not speak a version the engine offered, so the frames mean nothing.
+	if conn.Subprotocol() != protocolV1 {
+		return Result{}, fmt.Errorf("worker %q answered with subprotocol %q, want %q",
+			address, conn.Subprotocol(), protocolV1)
+	}
 
+	if history == nil {
+		history = []journal.Entry{}
+	}
 	start := streamFrame{
 		Type:         frameStart,
 		InvocationID: string(inv.ID),
 		Handler:      inv.Handler,
 		Input:        inv.Input,
-		Journal:      history,
+		Journal:      &history,
 	}
 	if err := wsjson.Write(ctx, conn, start); err != nil {
 		return Result{}, fmt.Errorf("sending start to worker: %w", err)

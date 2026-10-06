@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/coder/websocket"
@@ -27,7 +28,9 @@ func TestWSExecutorAcknowledgesEachDurableEntry(t *testing.T) {
 
 	observed := make(chan []testStreamFrame, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := websocket.Accept(w, r, nil)
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			Subprotocols: []string{"keel.v1"},
+		})
 		if err != nil {
 			t.Errorf("Accept: %v", err)
 			return
@@ -93,7 +96,9 @@ func TestWSExecutorTreatsCloseAsUnfinished(t *testing.T) {
 	t.Parallel()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := websocket.Accept(w, r, nil)
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			Subprotocols: []string{"keel.v1"},
+		})
 		if err != nil {
 			t.Errorf("Accept: %v", err)
 			return
@@ -114,5 +119,97 @@ func TestWSExecutorTreatsCloseAsUnfinished(t *testing.T) {
 	}
 	if res.Done {
 		t.Fatalf("result = %+v, want unfinished", res)
+	}
+}
+
+func TestWSExecutorRefusesAWorkerWithoutTheSubprotocol(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Sec-WebSocket-Protocol") != "keel.v1" {
+			t.Errorf("the engine offered %q", r.Header.Get("Sec-WebSocket-Protocol"))
+		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("Accept: %v", err)
+			return
+		}
+		defer conn.CloseNow()
+	}))
+	t.Cleanup(srv.Close)
+
+	if _, err := dispatch.NewWSExecutor(newStore()).Execute(t.Context(), attempt("ws-3", srv.URL)); err == nil {
+		t.Fatal("Execute accepted a worker that echoed no subprotocol")
+	}
+}
+
+// TestWorkerProtocolFrameJSON pins the exact bytes of every frame. An
+// SDK in another language reads docs/worker-protocol.md, and this test
+// is what keeps the page and the wire in agreement.
+func TestWorkerProtocolFrameJSON(t *testing.T) {
+	t.Parallel()
+
+	observed := make(chan []string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			Subprotocols: []string{"keel.v1"},
+		})
+		if err != nil {
+			t.Errorf("Accept: %v", err)
+			return
+		}
+		defer conn.CloseNow()
+
+		var raw []string
+		kind, start, err := conn.Read(r.Context())
+		if err != nil {
+			t.Errorf("read start: %v", err)
+			return
+		}
+		raw = append(raw, string(start))
+
+		if err := conn.Write(r.Context(), websocket.MessageText, []byte(
+			`{"type":"entry","entry":{"step":0,"name":"charge","output":{"id":"ch_1"}}}`)); err != nil {
+			t.Errorf("write entry: %v", err)
+			return
+		}
+		_, accepted, err := conn.Read(r.Context())
+		if err != nil {
+			t.Errorf("read accepted: %v", err)
+			return
+		}
+		raw = append(raw, string(accepted))
+
+		if err := conn.Write(r.Context(), websocket.MessageText, []byte(
+			`{"type":"succeeded","output":{"ok":true}}`)); err != nil {
+			t.Errorf("write success: %v", err)
+			return
+		}
+		if kind != websocket.MessageText {
+			t.Errorf("frame kind = %v, want text", kind)
+		}
+		observed <- raw
+	}))
+	t.Cleanup(srv.Close)
+
+	res, err := dispatch.NewWSExecutor(newStore()).Execute(t.Context(), attempt("ws-4", srv.URL))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !res.Done {
+		t.Fatalf("result = %+v, want success", res)
+	}
+
+	raw := <-observed
+	// wsjson frames carry one trailing newline. A receiver must accept
+	// one, so the golden bytes keep it out of the comparison.
+	for i := range raw {
+		raw[i] = strings.TrimRight(raw[i], "\n")
+	}
+	if raw[0] != `{"type":"start","invocation_id":"ws-4","handler":"Charge","input":{},"journal":[]}` {
+		t.Fatalf("start = %s", raw[0])
+	}
+	if raw[1] != `{"type":"accepted","step":0}` {
+		t.Fatalf("accepted = %s", raw[1])
 	}
 }
