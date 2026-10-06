@@ -60,19 +60,19 @@ func (f *fakeStore) count() int {
 	return len(f.records)
 }
 
-// fakeDispatcher records the markers a submission hands over.
-type fakeDispatcher struct {
+// fakeNotifier records the markers a submission hands over.
+type fakeNotifier struct {
 	mu      sync.Mutex
 	markers []invocation.WakeupMarker
 }
 
-func (f *fakeDispatcher) Notify(m invocation.WakeupMarker) {
+func (f *fakeNotifier) Notify(m invocation.WakeupMarker) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.markers = append(f.markers, m)
 }
 
-func (f *fakeDispatcher) count() int {
+func (f *fakeNotifier) count() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.markers)
@@ -124,7 +124,7 @@ func TestNewRejectsAnIncompleteConfig(t *testing.T) {
 			}
 		})
 	}
-	// A dispatcher is optional, because the handoff is latency only.
+	// A notifier is optional, because the handoff is latency only.
 	if _, err := engine.New(full); err != nil {
 		t.Fatalf("New rejected a complete config: %v", err)
 	}
@@ -153,12 +153,12 @@ func TestSubmitRecordsAPendingInvocation(t *testing.T) {
 	}
 }
 
-func TestSubmitHandsTheMarkerToTheDispatcher(t *testing.T) {
+func TestSubmitHandsTheMarkerToTheNotifier(t *testing.T) {
 	t.Parallel()
 
-	d := &fakeDispatcher{}
+	d := &fakeNotifier{}
 	e, err := engine.New(engine.Config{
-		Records: newStore(), Workers: worker.NewMemory(), Dispatcher: d,
+		Records: newStore(), Workers: worker.NewMemory(), Notifier: d,
 	})
 	if err != nil {
 		t.Fatalf("engine.New: %v", err)
@@ -184,10 +184,10 @@ func TestSubmitHandsTheMarkerToTheDispatcher(t *testing.T) {
 	}
 }
 
-func TestSubmitWithoutADispatcher(t *testing.T) {
+func TestSubmitWithoutANotifier(t *testing.T) {
 	t.Parallel()
 
-	// The handoff is latency and never correctness, so a nil dispatcher
+	// The handoff is latency and never correctness, so a nil notifier
 	// must not fail a submission.
 	e, _, _ := newEngine(t)
 	if _, err := e.Submit(t.Context(), inv("demo", "Charge", "order-1", nil)); err != nil {

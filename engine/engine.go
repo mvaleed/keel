@@ -18,9 +18,9 @@ import (
 // input. The id is reused, and the caller must pick a new one.
 var ErrInputConflict = errors.New("engine: id submitted with a different input")
 
-// A Dispatcher learns that an invocation is due, so a submission need
+// A Notifier learns that an invocation is due, so a submission need
 // not wait for the next scan. Notify must not block.
-type Dispatcher interface {
+type Notifier interface {
 	Notify(m invocation.WakeupMarker)
 }
 
@@ -30,9 +30,9 @@ type Config struct {
 	Records invocation.Store
 	Workers worker.Registry
 
-	// Dispatcher takes a new marker at once. It may be nil, because the
+	// Notifier takes a new marker at once. It may be nil, because the
 	// handoff is latency and never correctness.
-	Dispatcher Dispatcher
+	Notifier Notifier
 }
 
 // Engine records the invocations a client submits, and answers the
@@ -94,11 +94,11 @@ func (e *Engine) Submit(ctx context.Context, inv invocation.Invocation) (Submiss
 	}
 }
 
-// notify hands a marker to the dispatcher. An absent dispatcher is not
+// notify hands a marker to the notifier. An absent notifier is not
 // an error, because the next scan finds the marker anyway.
 func (e *Engine) notify(m invocation.WakeupMarker) {
-	if e.cfg.Dispatcher != nil {
-		e.cfg.Dispatcher.Notify(m)
+	if e.cfg.Notifier != nil {
+		e.cfg.Notifier.Notify(m)
 	}
 }
 

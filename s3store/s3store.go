@@ -93,7 +93,7 @@ func New(client api, bucket, rootPrefix string) (*Store, error) {
 
 // NewFromEnv returns a store that uses the default AWS configuration of
 // the environment.
-func NewFromEnv(bucket string, rootPrefix string) (*Store, error) {
+func NewFromEnv(bucket, rootPrefix string) (*Store, error) {
 	cfg, err := config.LoadDefaultConfig(context.Background())
 	if err != nil {
 		return nil, fmt.Errorf("s3store: load AWS config: %w", err)

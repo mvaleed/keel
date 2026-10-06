@@ -16,36 +16,32 @@ func (i ID) String() string { return string(i) }
 
 // gen holds the id generator state. The mutex covers the timestamp and
 // the entropy source together, so ids come out in the order they are made.
-var gen struct {
-	sync.Mutex
+var (
+	genMu sync.Mutex
 	// entropy increments the random component for ids that share a
 	// millisecond, so ids are strictly increasing within a tick.
-	entropy *ulid.MonotonicEntropy
+	entropy = ulid.Monotonic(rand.Reader, 0)
 	// lastMS is the timestamp of the previous id. It is used again if
 	// the clock goes backwards, so ids never sort backwards.
 	lastMS uint64
-}
-
-func init() {
-	gen.entropy = ulid.Monotonic(rand.Reader, 0)
-}
+)
 
 // NewID returns a fresh ULID. It returns an error if too many ids were
 // made in one millisecond.
 func NewID() (ID, error) {
 	ms := ulid.Timestamp(time.Now())
 
-	gen.Lock()
-	defer gen.Unlock()
+	genMu.Lock()
+	defer genMu.Unlock()
 
-	if ms < gen.lastMS {
-		ms = gen.lastMS
+	if ms < lastMS {
+		ms = lastMS
 	}
 
-	id, err := ulid.New(ms, gen.entropy)
+	id, err := ulid.New(ms, entropy)
 	if err != nil {
 		return "", err
 	}
-	gen.lastMS = ms
+	lastMS = ms
 	return ID(id.String()), nil
 }
