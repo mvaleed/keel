@@ -126,12 +126,13 @@ recovers sooner and writes more renewals. Two minutes at 1000 concurrent
 invocations is already about 50 storage writes per second, which is what
 argues against going much shorter.
 
-## The limit that is still open
+## The limit that closed
 
-`httpExecutor` only calls `Progress` when the worker replies, at the very
-end of the call. So a handler that runs longer than the lease ttl over
-plain HTTP is treated as a stall and cancelled.
+The request and response executor called `Progress` only when the worker
+replied, at the very end of the call. A handler that ran longer than the
+lease ttl over plain HTTP was treated as a stall and cancelled.
 
-That is correct for a streaming transport and premature for a
-request and response one. The bidirectional stream, which reports each
-journal entry as it happens, is what closes it.
+The WebSocket executor replaced it. Each journal entry is a frame, and
+each frame calls `Progress`, so a handler that reports progress keeps
+its lease for as long as it advances. A handler that goes silent for a
+whole ttl is still a stall, whatever the transport.
