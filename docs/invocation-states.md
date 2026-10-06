@@ -1,6 +1,6 @@
 # The states of one invocation
 
-An invocation moves through four states. The states are the easy part.
+An invocation moves through five states. The states are the easy part.
 The hard part is what the four durable parts look like in each one, so
 this page shows both together.
 
@@ -19,9 +19,12 @@ stateDiagram-v2
     Running --> Running: stopped early, retry
     Running --> Succeeded: the handler returned
     Running --> Failed: the handler returned an error
+    Pending --> Cancelled: cancel
+    Running --> Cancelled: cancel
 
     Succeeded --> [*]
     Failed --> [*]
+    Cancelled --> [*]
 
     note right of Pending
         record  status pending
@@ -55,6 +58,7 @@ Each arrow moves the marker, and some of them touch the counters:
 | stopped early, no progress | `now + backoff` | `Failures + 1` |
 | stopped early, after progress | `now` | `Failures` reset to 0 |
 | the handler returned | deleted | terminal, output or error set |
+| `Cancel` | deleted after the record | terminal, `cancelled`. The attempt in flight stops after the write. |
 
 ## Why the marker never sits still
 

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"iter"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -52,6 +54,27 @@ func (f *fakeStore) Update(_ context.Context, r invocation.Record) error {
 	defer f.mu.Unlock()
 	f.records[r.Key()] = r
 	return nil
+}
+
+func (f *fakeStore) List(_ context.Context, service, handler string) iter.Seq2[invocation.Record, error] {
+	return func(yield func(invocation.Record, error) bool) {
+		f.mu.Lock()
+		matches := make([]invocation.Record, 0, len(f.records))
+		for key, r := range f.records {
+			if strings.HasPrefix(key, service+"/"+handler) {
+				matches = append(matches, r)
+			}
+		}
+		f.mu.Unlock()
+		slices.SortFunc(matches, func(a, b invocation.Record) int {
+			return strings.Compare(a.Key(), b.Key())
+		})
+		for _, r := range matches {
+			if !yield(r, nil) {
+				return
+			}
+		}
+	}
 }
 
 func (f *fakeStore) count() int {
@@ -390,3 +413,77 @@ func TestDeregisterWorkerRemovesIt(t *testing.T) {
 		t.Fatalf("err = %v, want %v", err, worker.ErrNoWorker)
 	}
 }
+
+func TestCancelMarksTheRecordCancelled(t *testing.T) {
+	t.Parallel()
+
+	e, store, _ := newEngine(t)
+	sub, err := e.Submit(context.Background(), inv("billing", "Charge", "order-1", json.RawMessage(`{"amount":5}`)))
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+
+	var stopped []string
+	e2, err := engine.New(engine.Config{
+		Records:  store,
+		Workers:  worker.NewMemory(),
+		Canceler: cancelerFunc(func(key string) { stopped = append(stopped, key) }),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	rec, err := e2.Cancel(context.Background(), sub.Record.Invocation)
+	if err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	if rec.Status != invocation.Cancelled {
+		t.Fatalf("status = %q, want cancelled", rec.Status)
+	}
+	if got := store.records[sub.Record.Key()].Status; got != invocation.Cancelled {
+		t.Fatalf("stored status = %q, want cancelled", got)
+	}
+	if len(stopped) != 1 || stopped[0] != sub.Record.Key() {
+		t.Fatalf("canceler got %v, want %q", stopped, sub.Record.Key())
+	}
+}
+
+func TestCancelOfATerminalInvocationChangesNothing(t *testing.T) {
+	t.Parallel()
+
+	e, store, _ := newEngine(t)
+	sub, err := e.Submit(context.Background(), inv("billing", "Charge", "order-2", json.RawMessage(`{}`)))
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	rec, err := e.Cancel(context.Background(), sub.Record.Invocation)
+	if err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	rec.Status = invocation.Succeeded
+	rec.Output = json.RawMessage(`{"ok":true}`)
+	if err := store.Update(context.Background(), rec); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	got, err := e.Cancel(context.Background(), sub.Record.Invocation)
+	if err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	if got.Status != invocation.Succeeded {
+		t.Fatalf("status = %q, want the terminal one kept", got.Status)
+	}
+}
+
+func TestCancelOfAnUnknownInvocation(t *testing.T) {
+	t.Parallel()
+
+	e, _, _ := newEngine(t)
+	if _, err := e.Cancel(context.Background(), inv("billing", "Charge", "no-such", nil)); !errors.Is(err, invocation.ErrNotFound) {
+		t.Fatalf("err = %v, want %v", err, invocation.ErrNotFound)
+	}
+}
+
+type cancelerFunc func(string)
+
+func (f cancelerFunc) CancelRun(key string) { f(key) }

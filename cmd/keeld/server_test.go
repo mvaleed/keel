@@ -20,10 +20,12 @@ import (
 type fakeCoordinator struct {
 	sub        engine.Submission
 	rec        invocation.Record
+	recs       []invocation.Record
 	err        error
 	lastInv    invocation.Invocation
 	lastWorker worker.Worker
 	dropped    string
+	cancelled  bool
 }
 
 func (f *fakeCoordinator) Submit(_ context.Context, inv invocation.Invocation) (engine.Submission, error) {
@@ -39,6 +41,22 @@ func (f *fakeCoordinator) Lookup(_ context.Context, inv invocation.Invocation) (
 	if f.err != nil {
 		return invocation.Record{}, f.err
 	}
+	return f.rec, nil
+}
+
+func (f *fakeCoordinator) List(_ context.Context, _, _ string) ([]invocation.Record, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.recs, nil
+}
+
+func (f *fakeCoordinator) Cancel(_ context.Context, inv invocation.Invocation) (invocation.Record, error) {
+	f.lastInv = inv
+	if f.err != nil {
+		return invocation.Record{}, f.err
+	}
+	f.cancelled = true
 	return f.rec, nil
 }
 
@@ -85,6 +103,13 @@ func get(t *testing.T, h http.Handler, path string) *httptest.ResponseRecorder {
 	t.Helper()
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+	return w
+}
+
+func deleteTo(t *testing.T, h http.Handler, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, path, nil))
 	return w
 }
 
@@ -297,5 +322,61 @@ func TestDeregisterWorker(t *testing.T) {
 	}
 	if c.dropped != "w1" {
 		t.Fatalf("dropped = %q, want %q", c.dropped, "w1")
+	}
+}
+
+func TestListReturnsTheRecords(t *testing.T) {
+	t.Parallel()
+
+	c := &fakeCoordinator{recs: []invocation.Record{record()}}
+	w := get(t, newServer(c), "/v1/invocations?service=billing&handler=Charge")
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200: %s", w.Code, w.Body)
+	}
+	var got []invocationResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decoding the reply: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "order-1" {
+		t.Fatalf("reply = %+v", got)
+	}
+}
+
+func TestListReturnsAnEmptyArray(t *testing.T) {
+	t.Parallel()
+
+	w := get(t, newServer(&fakeCoordinator{}), "/v1/invocations")
+	if w.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200", w.Code)
+	}
+	if strings.TrimSpace(w.Body.String()) != "[]" {
+		t.Fatalf("body = %q, want []", w.Body)
+	}
+}
+
+func TestCancelCallsTheEngine(t *testing.T) {
+	t.Parallel()
+
+	c := &fakeCoordinator{rec: record()}
+	w := deleteTo(t, newServer(c), "/v1/invocations/billing/Charge/order-1")
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200: %s", w.Code, w.Body)
+	}
+	if !c.cancelled {
+		t.Fatal("the engine was not asked to cancel")
+	}
+	if c.lastInv.Key() != "billing/Charge/order-1" {
+		t.Fatalf("cancelled %q", c.lastInv.Key())
+	}
+}
+
+func TestCancelMapsTheEngineErrors(t *testing.T) {
+	t.Parallel()
+
+	c := &fakeCoordinator{err: invocation.ErrNotFound}
+	if w := deleteTo(t, newServer(c), "/v1/invocations/billing/Charge/never"); w.Code != http.StatusNotFound {
+		t.Fatalf("code = %d, want 404", w.Code)
 	}
 }

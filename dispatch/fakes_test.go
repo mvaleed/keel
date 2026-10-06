@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -73,6 +74,27 @@ func (f *fakeStore) Update(_ context.Context, r invocation.Record) error {
 	}
 	f.records[r.Key()] = r
 	return nil
+}
+
+func (f *fakeStore) List(_ context.Context, service, handler string) iter.Seq2[invocation.Record, error] {
+	return func(yield func(invocation.Record, error) bool) {
+		f.mu.Lock()
+		matches := make([]invocation.Record, 0, len(f.records))
+		for key, r := range f.records {
+			if strings.HasPrefix(key, service+"/"+handler) {
+				matches = append(matches, r)
+			}
+		}
+		f.mu.Unlock()
+		slices.SortFunc(matches, func(a, b invocation.Record) int {
+			return strings.Compare(a.Key(), b.Key())
+		})
+		for _, r := range matches {
+			if !yield(r, nil) {
+				return
+			}
+		}
+	}
 }
 
 func (f *fakeStore) Append(_ context.Context, _ string, epoch lease.Epoch, e journal.Entry) error {
@@ -250,6 +272,14 @@ type fakeExecutor struct {
 	mu    sync.Mutex
 	calls map[string]int
 	reply func(dispatch.Attempt) (dispatch.Result, error)
+}
+
+// executorFunc is an executor built from a function that sees the
+// attempt's context.
+type executorFunc func(context.Context, dispatch.Attempt) (dispatch.Result, error)
+
+func (f executorFunc) Execute(ctx context.Context, a dispatch.Attempt) (dispatch.Result, error) {
+	return f(ctx, a)
 }
 
 func newExecutor(reply func(dispatch.Attempt) (dispatch.Result, error)) *fakeExecutor {

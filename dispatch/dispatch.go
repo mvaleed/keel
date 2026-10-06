@@ -98,9 +98,11 @@ type Dispatcher struct {
 	wg sync.WaitGroup
 
 	// mu guards inflight, which drops a key that the scan and the
-	// handoff both yield.
+	// handoff both yield, and cancels, which holds the cancel function
+	// of every attempt in flight.
 	mu       sync.Mutex
 	inflight map[string]bool
+	cancels  map[string]context.CancelFunc
 }
 
 // New returns a Dispatcher. It returns an error if a required part of
@@ -142,6 +144,7 @@ func New(cfg Config) (*Dispatcher, error) {
 		dispatchSlots: make(chan struct{}, cfg.DispatchConcurrency),
 		executeSlots:  make(chan struct{}, cfg.ExecuteConcurrency),
 		inflight:      make(map[string]bool),
+		cancels:       make(map[string]context.CancelFunc),
 	}, nil
 }
 
@@ -152,6 +155,31 @@ func (d *Dispatcher) Notify(m invocation.WakeupMarker) {
 	case d.handoff <- m:
 	default:
 	}
+}
+
+// CancelRun stops the attempt in flight for key. It is safe to call for
+// a key that no attempt is driving, because the record alone cancels
+// the invocation.
+func (d *Dispatcher) CancelRun(key string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if cancel, ok := d.cancels[key]; ok {
+		cancel()
+	}
+}
+
+// takeCancel registers the cancel function of one attempt.
+func (d *Dispatcher) takeCancel(key string, cancel context.CancelFunc) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.cancels[key] = cancel
+}
+
+// dropCancel forgets the cancel function of one attempt.
+func (d *Dispatcher) dropCancel(key string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.cancels, key)
 }
 
 // Run drives the invocations until ctx ends. It returns after every

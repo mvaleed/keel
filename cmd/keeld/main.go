@@ -73,6 +73,7 @@ func main() {
 		Records:  store,
 		Workers:  registry,
 		Notifier: d,
+		Canceler: d,
 	})
 	if err != nil {
 		log.Fatal(err)

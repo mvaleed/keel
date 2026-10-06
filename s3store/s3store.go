@@ -270,6 +270,42 @@ func (s *Store) Update(ctx context.Context, r invocation.Record) error {
 	return nil
 }
 
+// List yields every record whose invocation key starts with the given
+// service and handler, in key order. Each invocation folder also holds
+// its lease and its entries, so the listing keeps the records only.
+func (s *Store) List(ctx context.Context, service, handler string) iter.Seq2[invocation.Record, error] {
+	return func(yield func(invocation.Record, error) bool) {
+		prefix := path.Join(s.rootPrefix, "invocations", service, handler)
+		if !strings.HasSuffix(prefix, "/") {
+			prefix += "/"
+		}
+
+		pages := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
+			Bucket: aws.String(s.bucket),
+			Prefix: aws.String(prefix),
+		})
+
+		for pages.HasMorePages() {
+			page, err := pages.NextPage(ctx)
+			if err != nil {
+				yield(invocation.Record{}, fmt.Errorf("s3store: list records: %w", err))
+				return
+			}
+			for _, obj := range page.Contents {
+				objectKey := aws.ToString(obj.Key)
+				if path.Base(objectKey) != "invocation.json" {
+					continue
+				}
+				key := strings.TrimSuffix(strings.TrimPrefix(objectKey, prefix), "/invocation.json")
+				r, err := s.Get(ctx, key)
+				if !yield(r, err) || err != nil {
+					return
+				}
+			}
+		}
+	}
+}
+
 // Schedule writes a marker that falls due at the given time. The marker
 // body is empty, because a listing returns the keys and not the bodies.
 func (s *Store) Schedule(ctx context.Context, key string, due time.Time) error {

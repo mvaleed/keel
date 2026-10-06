@@ -36,12 +36,13 @@ const (
 	Running   Status = "running"
 	Succeeded Status = "succeeded"
 	Failed    Status = "failed"
+	Cancelled Status = "cancelled"
 )
 
 // Terminal reports whether the status is final. A terminal invocation
 // never runs again, so a dispatcher drops its marker.
 func (s Status) Terminal() bool {
-	return s == Succeeded || s == Failed
+	return s == Succeeded || s == Failed || s == Cancelled
 }
 
 // A Record is the durable statement that an invocation must run. It is
@@ -86,6 +87,11 @@ type Store interface {
 	// Update replaces the record. It returns lease.ErrLeaseLost when the
 	// stored record carries a later epoch, because a stale holder wrote it.
 	Update(ctx context.Context, r Record) error
+
+	// List yields every record whose key starts with the prefix, in key
+	// order. An empty service or handler widens the prefix. A record that
+	// fails to read yields its error and stops the iteration.
+	List(ctx context.Context, service, handler string) iter.Seq2[Record, error]
 }
 
 // A WakeupMarker says an invocation must be looked at again at a time.

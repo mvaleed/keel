@@ -46,8 +46,12 @@ func newDriver(d *Dispatcher, rec invocation.Record, w worker.Worker, l *lease.L
 // attempt must start at once instead of after a backoff.
 func (dr *driver) drive(ctx context.Context) (again bool, err error) {
 	// The renewer cancels this context when the lease is lost or when the
-	// attempt stalls, so the executor stops with it.
+	// attempt stalls, so the executor stops with it. A cancellation
+	// from the engine cancels it too, which makes the executor send the
+	// cancel frame to the worker.
 	runCtx, cancel := context.WithCancel(ctx)
+	dr.d.takeCancel(dr.rec.Key(), cancel)
+	defer dr.d.dropCancel(dr.rec.Key())
 	defer cancel()
 	defer func() {
 		// Release under an uncancelled context, or a shutdown leaves the
@@ -64,12 +68,33 @@ func (dr *driver) drive(ctx context.Context) (again bool, err error) {
 	})
 	stop()
 
+	// The record is the authority. A cancel that landed while the
+	// attempt ran is final, so the attempt writes nothing and drops the
+	// marker instead of reviving the invocation.
+	if dr.superseded(ctx) {
+		return false, execErr
+	}
+
 	if execErr != nil || !res.Done {
 		// The attempt stopped early, which is neither a success nor a
 		// failure. Give it back to the scan.
 		return dr.retry(ctx, execErr)
 	}
 	return false, dr.finish(ctx, res)
+}
+
+// superseded reports that the stored record became terminal while the
+// attempt ran, and drops the marker when it did. A store error reports
+// false, because the attempt may still finish the work.
+func (dr *driver) superseded(ctx context.Context) bool {
+	stored, err := dr.d.cfg.Records.Get(ctx, dr.rec.Key())
+	if err != nil || !stored.Status.Terminal() {
+		return false
+	}
+	if err := dr.d.cfg.DueIndex.Forget(ctx, dr.marker()); err != nil {
+		dr.d.cfg.Log.Error("keel: forget the marker", "key", dr.rec.Key(), "error", err)
+	}
+	return true
 }
 
 // progress records that the invocation advanced. The executor calls it

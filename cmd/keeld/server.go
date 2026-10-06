@@ -21,6 +21,8 @@ const maxRequestSize = 1 << 20
 type invocations interface {
 	Submit(context.Context, invocation.Invocation) (engine.Submission, error)
 	Lookup(context.Context, invocation.Invocation) (invocation.Record, error)
+	List(context.Context, string, string) ([]invocation.Record, error)
+	Cancel(context.Context, invocation.Invocation) (invocation.Record, error)
 }
 
 // workers is the half of the engine that answers a worker.
@@ -45,7 +47,9 @@ type server struct {
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/invocations", s.submit)
+	mux.HandleFunc("GET /v1/invocations", s.list)
 	mux.HandleFunc("GET /v1/invocations/{service}/{handler}/{id}", s.get)
+	mux.HandleFunc("DELETE /v1/invocations/{service}/{handler}/{id}", s.cancel)
 	mux.HandleFunc("POST /v1/workers", s.registerWorker)
 	mux.HandleFunc("DELETE /v1/workers/{id}", s.deregisterWorker)
 
@@ -133,6 +137,39 @@ func (s *server) submit(w http.ResponseWriter, r *http.Request) {
 // registration does not wait for the run.
 func (s *server) get(w http.ResponseWriter, r *http.Request) {
 	rec, err := s.engine.Lookup(r.Context(), invocation.Invocation{
+		ID:      invocation.ID(r.PathValue("id")),
+		Service: r.PathValue("service"),
+		Handler: r.PathValue("handler"),
+	})
+	if err != nil {
+		writeError(w, statusFor(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, response(rec))
+}
+
+// list returns the recorded invocations, newest key last. The service
+// and the handler query parameters narrow the list, and either may be
+// left out to widen it.
+func (s *server) list(w http.ResponseWriter, r *http.Request) {
+	recs, err := s.engine.List(r.Context(),
+		r.URL.Query().Get("service"), r.URL.Query().Get("handler"))
+	if err != nil {
+		writeError(w, statusFor(err), err.Error())
+		return
+	}
+	out := make([]invocationResponse, 0, len(recs))
+	for _, rec := range recs {
+		out = append(out, response(rec))
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// cancel marks the invocation cancelled and stops its attempt. It is
+// not an error to cancel an invocation that already ended, because the
+// caller may repeat the call.
+func (s *server) cancel(w http.ResponseWriter, r *http.Request) {
+	rec, err := s.engine.Cancel(r.Context(), invocation.Invocation{
 		ID:      invocation.ID(r.PathValue("id")),
 		Service: r.PathValue("service"),
 		Handler: r.PathValue("handler"),

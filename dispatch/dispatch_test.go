@@ -607,3 +607,71 @@ func waitForBackoff(t *testing.T, idx *fakeIndex, locker *fakeLocker, n int) tim
 	})
 	return got
 }
+
+func TestDispatcherDoesNotReviveACancelledInvocation(t *testing.T) {
+	t.Parallel()
+
+	// The engine cancels while the attempt runs. The attempt was about
+	// to succeed, but the record is the authority, so the result must
+	// not overwrite the cancellation.
+	rec := pending("demo", "Charge", "id-cancel")
+	var st *fakeStore
+	ex := newExecutor(func(a dispatch.Attempt) (dispatch.Result, error) {
+		got, err := st.Get(context.Background(), a.Record.Key())
+		if err != nil {
+			return dispatch.Result{}, err
+		}
+		got.Status = invocation.Cancelled
+		if err := st.Update(context.Background(), got); err != nil {
+			return dispatch.Result{}, err
+		}
+		return dispatch.Result{Done: true, Output: json.RawMessage(`{}`)}, nil
+	})
+	d, idx, store, _ := dispatcher(t, ex, rec)
+	st = store
+	start(t, d)
+
+	eventually(t, "the marker to go", func() bool { return idx.count() == 0 })
+	if got := status(t, store, rec.Key()); got.Status != invocation.Cancelled {
+		t.Fatalf("status = %q, want cancelled", got.Status)
+	}
+	if got := status(t, store, rec.Key()); got.Output != nil {
+		t.Fatalf("output = %s, want none under a cancellation", got.Output)
+	}
+}
+
+func TestDispatcherCancelRunStopsTheAttempt(t *testing.T) {
+	t.Parallel()
+
+	rec := pending("demo", "Charge", "id-stop")
+	started := make(chan context.Context, 1)
+	ex := executorFunc(func(ctx context.Context, a dispatch.Attempt) (dispatch.Result, error) {
+		started <- ctx
+		<-ctx.Done()
+		return dispatch.Result{Done: false}, ctx.Err()
+	})
+	d, idx, store, _ := dispatcher(t, ex, rec)
+	start(t, d)
+
+	var runCtx context.Context
+	eventually(t, "the attempt to start", func() bool {
+		select {
+		case runCtx = <-started:
+			return true
+		default:
+			return false
+		}
+	})
+
+	d.CancelRun(rec.Key())
+	eventually(t, "the attempt to stop", func() bool {
+		return runCtx.Err() != nil
+	})
+	eventually(t, "the marker to move to the backoff", func() bool {
+		markers := idx.all()
+		return len(markers) == 1 && markers[0].Due.After(time.Now())
+	})
+	if got := status(t, store, rec.Key()); got.Status != invocation.Running {
+		t.Fatalf("status = %q, want running, because the run may resume", got.Status)
+	}
+}
