@@ -48,6 +48,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /v1/invocations/{service}/{handler}/{id}", s.get)
 	mux.HandleFunc("POST /v1/workers", s.registerWorker)
 	mux.HandleFunc("DELETE /v1/workers/{id}", s.deregisterWorker)
+
 	return mux
 }
 

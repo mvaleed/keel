@@ -58,7 +58,7 @@ func main() {
 		DueIndex:            store,
 		Locker:              store,
 		Workers:             registry,
-		Executor:            dispatch.NewHTTPExecutor(store),
+		Executor:            dispatch.NewWSExecutor(store),
 		Owner:               *owner,
 		DispatchConcurrency: *dispatches,
 		ExecuteConcurrency:  *executions,
@@ -70,9 +70,9 @@ func main() {
 	}
 
 	e, err := engine.New(engine.Config{
-		Records:    store,
-		Workers:    registry,
-		Dispatcher: d,
+		Records:  store,
+		Workers:  registry,
+		Notifier: d,
 	})
 	if err != nil {
 		log.Fatal(err)
